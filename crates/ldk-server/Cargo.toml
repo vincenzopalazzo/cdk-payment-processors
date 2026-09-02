@@ -2,23 +2,52 @@
 name = "cdk-payment-processor-ldk-server"
 version = "0.1.0"
 edition = "2021"
+authors = ["Vincenzo Palazzo <vincenzopalazzodev@gmail.com>"]
 description = "CDK Payment Processor backed by an LDK Server node"
 license = "MIT"
+
+[features]
+default = []
+regtest-tests = [
+    "dep:axum",
+    "dep:cdk",
+    "dep:cdk-axum",
+    "dep:cdk-sqlite",
+    "dep:corepc-node",
+    "dep:lightning-invoice",
+]
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-bitcoin = { version = "0.32.2", features = ["base64", "serde", "rand", "rand-std"] }
-cdk-common = { version = "0.17.3", default-features = false, features = ["mint", "grpc"] }
-cdk-payment-processor = { version = "0.17.3", default-features = false }
+cdk-common = { version = "=0.18.0-rc.3", default-features = false, features = ["mint", "grpc"] }
+cdk-payment-processor = { version = "=0.18.0-rc.3", default-features = false }
 figment = { version = "0.10", features = ["env", "toml"] }
 futures = "0.3"
-ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "50fe7523be3529d86bfee0dfc35df9a52aca7310", default-features = false }
-lightning = { version = "0.2.0", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
-tokio-util = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process", "sync", "net"] }
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# ldk-server deps
+
+bitcoin = { version = "0.32.2", features = ["base64", "serde", "rand", "rand-std"] }
+ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "50fe7523be3529d86bfee0dfc35df9a52aca7310", default-features = false }
+lightning = { version = "0.2.0", default-features = false, features = ["std"] }
+tokio-util = "0.7"
+
+# ldk-server regtest tests
+
+axum = { version = "0.8", optional = true }
+cdk = { version = "=0.18.0-rc.3", default-features = false, features = ["mint", "wallet"], optional = true }
+cdk-axum = { version = "=0.18.0-rc.3", optional = true }
+cdk-sqlite = { version = "=0.18.0-rc.3", default-features = false, features = ["mint", "wallet"], optional = true }
+corepc-node = { version = "0.10", features = ["download", "29_0"], optional = true }
+lightning-invoice = { version = "0.34", optional = true }
+
+[[test]]
+name = "regtest"
+path = "tests/regtest.rs"
+required-features = ["regtest-tests"]

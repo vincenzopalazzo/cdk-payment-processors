@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use figment::{
-    providers::{Format, Serialized, Toml},
+    providers::{Env, Format, Serialized, Toml},
     Figment,
 };
 use serde::{Deserialize, Serialize};
+
+const BACKEND_ENV_PREFIX: &str = "LDK_";
 
 /// LDK Server node connection and fee configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -64,10 +66,16 @@ pub struct Config {
     /// TLS for the payment processor gRPC server.
     #[serde(default)]
     pub tls_enable: bool,
+    /// Explicitly allow plaintext gRPC.
+    #[serde(default)]
+    pub allow_insecure: bool,
     #[serde(default = "default_tls_cert_path")]
     pub tls_cert_path: String,
     #[serde(default = "default_tls_key_path")]
     pub tls_key_path: String,
+    /// PEM CA certificate used to authenticate mint clients.
+    #[serde(default = "default_tls_client_ca_path")]
+    pub tls_client_ca_path: String,
 }
 
 fn default_address() -> String {
@@ -75,7 +83,7 @@ fn default_address() -> String {
 }
 
 fn default_port() -> u16 {
-    50071
+    50051
 }
 
 fn default_tls_cert_path() -> String {
@@ -86,32 +94,61 @@ fn default_tls_key_path() -> String {
     "certs/server.key".to_string()
 }
 
-impl Config {
-    /// Load config.toml (if present) overlaid by CDK_LDK_* environment variables.
-    pub fn load() -> Result<Self> {
-        let cfg: Self = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::file("config.toml"))
-            .merge(figment::providers::Env::prefixed("CDK_LDK_"))
-            .extract()
-            .context("failed to load configuration")?;
-        anyhow::ensure!(!cfg.backend.address.is_empty(), "backend.address is required");
-        anyhow::ensure!(!cfg.backend.api_key.is_empty(), "backend.api_key is required");
-        anyhow::ensure!(
-            !cfg.backend.tls_cert_path.is_empty(),
-            "backend.tls_cert_path is required"
-        );
-        Ok(cfg)
-    }
+fn default_tls_client_ca_path() -> String {
+    "certs/ca.pem".to_string()
+}
 
+impl Default for Config {
     fn default() -> Self {
         Self {
             backend: BackendConfig::default(),
             address: default_address(),
             port: default_port(),
             tls_enable: false,
+            allow_insecure: false,
             tls_cert_path: default_tls_cert_path(),
             tls_key_path: default_tls_key_path(),
+            tls_client_ca_path: default_tls_client_ca_path(),
         }
     }
+}
+
+impl Config {
+    /// Load from config.toml (if present) and environment variables.
+    /// Environment variables override file values.
+    pub fn load() -> Result<Self> {
+        let cfg = extract_config(config_figment())?;
+        anyhow::ensure!(
+            !cfg.backend.address.is_empty(),
+            "backend.address is required"
+        );
+        anyhow::ensure!(
+            !cfg.backend.api_key.is_empty(),
+            "backend.api_key is required"
+        );
+        anyhow::ensure!(
+            !cfg.backend.tls_cert_path.is_empty(),
+            "backend.tls_cert_path is required"
+        );
+        Ok(cfg)
+    }
+}
+
+fn config_figment() -> Figment {
+    let mut figment = Figment::from(Serialized::defaults(Config::default()));
+    if std::path::Path::new("config.toml").is_file() {
+        figment = figment.merge(Toml::file_exact("config.toml"));
+    }
+
+    figment
+        .merge(Env::prefixed("SERVER_"))
+        .merge(Env::prefixed("TLS_").map(|key| format!("tls_{}", key.as_str()).into()))
+        .merge(Env::raw().only(&["ALLOW_INSECURE"]))
+        .merge(
+            Env::prefixed(BACKEND_ENV_PREFIX).map(|key| format!("backend.{}", key.as_str()).into()),
+        )
+}
+
+fn extract_config(figment: Figment) -> Result<Config> {
+    figment.extract().context("failed to parse configuration")
 }
