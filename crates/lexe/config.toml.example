@@ -1,0 +1,40 @@
+# Copy this file to config.toml and fill in your values
+
+# gRPC server configuration
+address = "127.0.0.1"
+port = 50051
+
+# TLS configuration (optional)
+tls_enable = false
+allow_insecure = true
+tls_cert_path = "certs/server.crt"
+tls_key_path = "certs/server.key"
+tls_client_ca_path = "certs/ca.pem"
+
+# Lexe backend configuration
+[lexe]
+# PRIMARY (recommended): base64 Lexe SDK client credentials.
+# Create one in the Lexe app: Menu -> SDK clients -> Create.
+# This is the same credential lexe-mcp passes as `Authorization: Bearer <credentials>`.
+# LEXE_CLIENT_CREDENTIALS env var overrides this value.
+client_credentials = "PASTE_BASE64_LEXE_SDK_CLIENT_CREDENTIALS"
+
+# ALTERNATIVE: BIP39 seed phrase of the Lexe node (used when no SDK client
+# credentials are available; the processor signs up / provisions the node).
+# Set only one of client_credentials or seed_phrase.
+# seed_phrase = "your BIP39 mnemonic"
+
+# Lexe environment: mainnet | testnet3 | regtest
+network = "mainnet"
+
+# Data directory for the Lexe wallet state and the local quote database.
+data_dir = ".data/lexe"
+
+# Estimated outgoing fee for melt quotes (Lexe has no fee-estimate API):
+# fee = max(fee_reserve_ppm/1e6 * amount, fee_reserve_min_sat)
+fee_reserve_ppm = 100
+fee_reserve_min_sat = 1
+
+# Default outgoing payment timeout in seconds when the mint does not
+# provide one (Lexe preflight can take ~60s; keep well above that).
+payment_timeout_secs = 300
