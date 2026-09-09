@@ -44,6 +44,10 @@ pub struct MeltAttempt {
     pub quote_id: Option<QuoteId>,
     /// Unit in which the original attempt was requested.
     pub unit: CurrencyUnit,
+    /// True only when submission was definitively rejected, before acceptance.
+    /// Older attempts lack this field and must remain ambiguous.
+    #[serde(default)]
+    pub submission_rejected: bool,
 }
 
 /// Database wrapper for quote-to-payment mappings.
@@ -76,6 +80,7 @@ impl QuoteDatabase {
                         None => MeltAttempt {
                             quote_id: None,
                             unit: CurrencyUnit::Sat,
+                            submission_rejected: false,
                         },
                     };
                     let value = serde_json::to_string(&attempt)?;
@@ -157,6 +162,7 @@ impl QuoteDatabase {
             let value = serde_json::to_string(&MeltAttempt {
                 quote_id: Some(quote_id.clone()),
                 unit: unit.clone(),
+                submission_rejected: false,
             })?;
             attempts.insert(payment_hash, value.as_str())?;
         }
@@ -169,6 +175,31 @@ impl QuoteDatabase {
         self.get_mapping(MELT_ATTEMPTS_TABLE, payment_hash)?
             .map(|raw| serde_json::from_str(&raw).map_err(Into::into))
             .transpose()
+    }
+
+    /// Persist a definite submission rejection without releasing the claim or
+    /// changing its owner. Never downgrade an attempt with a known remote index.
+    pub fn reject_melt_attempt(&self, payment_hash: &[u8; 32]) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let indexes = write_txn.open_table(MELT_PAYMENT_IDS_TABLE)?;
+            anyhow::ensure!(
+                indexes.get(payment_hash)?.is_none(),
+                "Cannot reject an attempt with a remote payment index"
+            );
+            let mut attempts = write_txn.open_table(MELT_ATTEMPTS_TABLE)?;
+            let mut attempt: MeltAttempt = {
+                let raw = attempts
+                    .get(payment_hash)?
+                    .ok_or_else(|| anyhow::anyhow!("Outgoing attempt not found"))?;
+                serde_json::from_str(raw.value())?
+            };
+            attempt.submission_rejected = true;
+            let value = serde_json::to_string(&attempt)?;
+            attempts.insert(payment_hash, value.as_str())?;
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 
     fn insert_mapping(
@@ -261,7 +292,8 @@ mod tests {
             db.get_melt_attempt(&hash).expect("get melt attempt"),
             Some(MeltAttempt {
                 quote_id: Some(quote_id),
-                unit: CurrencyUnit::Msat
+                unit: CurrencyUnit::Msat,
+                submission_rejected: false,
             })
         );
 
@@ -316,6 +348,51 @@ mod tests {
     }
 
     #[test]
+    fn attempts_without_rejection_field_remain_ambiguous_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quotes.db");
+        let owner = QuoteId::new();
+        {
+            let db = QuoteDatabase::new(&path).unwrap();
+            let raw = serde_json::json!({"quote_id": owner.to_string(), "unit": "sat"});
+            db.insert_mapping(MELT_ATTEMPTS_TABLE, &[1; 32], &raw.to_string())
+                .unwrap();
+        }
+        let db = QuoteDatabase::new(&path).unwrap();
+        assert_eq!(
+            db.get_melt_attempt(&[1; 32]).unwrap().unwrap(),
+            MeltAttempt {
+                quote_id: Some(owner),
+                unit: CurrencyUnit::Sat,
+                submission_rejected: false,
+            }
+        );
+        assert!(!db
+            .begin_melt_attempt(&[1; 32], &QuoteId::new(), &CurrencyUnit::Sat)
+            .unwrap());
+    }
+
+    #[test]
+    fn rejection_requires_an_attempt_without_a_remote_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = QuoteDatabase::new(dir.path().join("quotes.db")).unwrap();
+        let hash = [1; 32];
+        assert!(db.reject_melt_attempt(&hash).is_err());
+        assert!(db.get_melt_attempt(&hash).unwrap().is_none());
+        db.begin_melt_attempt(&hash, &QuoteId::new(), &CurrencyUnit::Sat)
+            .unwrap();
+        db.insert_melt_payment_id(&hash, "known remote index")
+            .unwrap();
+        assert!(db.reject_melt_attempt(&hash).is_err());
+        assert!(
+            !db.get_melt_attempt(&hash)
+                .unwrap()
+                .unwrap()
+                .submission_rejected
+        );
+    }
+
+    #[test]
     fn migration_preserves_ambiguous_legacy_quotes_and_runs_only_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("quotes.db");
@@ -345,6 +422,7 @@ mod tests {
                 MeltAttempt {
                     quote_id: Some(owner),
                     unit: CurrencyUnit::Msat,
+                    submission_rejected: false,
                 }
             );
             assert!(db.get_melt_attempt(&[2; 32]).unwrap().is_some());

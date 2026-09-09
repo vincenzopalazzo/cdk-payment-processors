@@ -5,7 +5,7 @@ managed non-custodial Lightning node (SGX). Exposes the node to `cdk-mintd`
 over the CDK payment processor gRPC protocol, with BOLT11 support.
 
 The processor advertises `sat` and accepts new requests only in that unit.
-The pinned SDK cannot enforce routing fee limits: new outgoing payments with
+The processor cannot enforce routing fee limits: new outgoing payments with
 `max_fee_amount` are rejected before submission. This includes ordinary CDK
 melts that supply a fee cap; they require SDK support for an enforceable limit
 before they can be served by this processor. Incoming payments are supported.
@@ -108,11 +108,18 @@ trusted.
 - **Status and recovery:** stored indexes are queried first. A missing index
   is recovered by paginating the full history for an outbound payment with
   the same hash. Remote `completed`/`failed`/`pending` states become
-  `Paid`/`Failed`/`Pending`. Timeouts and SDK errors can occur after remote
-  acceptance, so an unresolved attempt remains `Pending` (or returns a
-  lookup error if the node cannot be reached). A crash between recording
-  intent and submission is also ambiguous and requires reconciliation;
-  absence from history alone does not permit another submission.
+  `Paid`/`Failed`/`Pending`. Definite submission rejections (request-building,
+  connection, request-validation, and authentication/permission errors) are
+  persisted and return `Failed`, with zero spent, without a remote lookup.
+  Retries and restarts preserve that result and the original quote owner.
+  Submission is separate from settlement polling: the accepted payment's
+  index is saved before polling, and errors during polling never mark it
+  rejected. Timeouts, response-decoding errors, generic command/server errors,
+  and other unclassified submission errors remain ambiguous. An unresolved
+  attempt stays `Pending` (or returns a lookup error if the node cannot be
+  reached); generic error messages and missing history do not prove rejection.
+  A crash between recording intent and submission is also ambiguous and
+  requires reconciliation. No existing attempt is automatically resubmitted.
 - **Events and reconnects:** `get_updated_payments` reads cached and new
   updates in batches, polling every 5 seconds when caught up and backing off
   on errors. Each subscription replays history from the beginning, then
@@ -144,14 +151,18 @@ still propagated.
 
 Run `just ci` for formatting, Clippy, and tests. Tests mock the Lexe SDK
 boundary and cover accounting, fee-cap rejection, concurrent submission,
+definite versus ambiguous submission errors, settlement polling failures,
 timeout/restart recovery, pagination, database migration, and event replay.
 They do not provision a node or make payments. End-to-end validation requires
 a real Lexe node and is not part of the test suite.
 
 ## Notes
 
-- Depends on the `lexe` Rust SDK (crates.io, pinned to `=0.1.22`). The crate
-  ships a library (shared backend, used by its unit tests) plus the gRPC
-  server binary; it is not published to crates.io.
+- Depends on the `lexe` Rust SDK and `lexe-api-core` (crates.io, both pinned
+  to `=0.1.22`). The SDK's `unstable` low-level node client is used only to
+  separate submission from settlement and classify typed submission errors;
+  upgrades must revalidate those error semantics. The crate ships a library
+  (shared backend, used by its unit tests) plus the gRPC server binary; it is
+  not published to crates.io.
 - BOLT11 only; BOLT12 and on-chain payment options are not supported yet.
 - A `Cargo.lock` is committed for reproducible standalone builds.

@@ -39,7 +39,7 @@ use lexe::wallet::LexeWallet;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::client::LexeClient;
+use crate::client::{LexeClient, SubmissionError};
 use crate::database::QuoteDatabase;
 use crate::settings::Config;
 
@@ -332,19 +332,15 @@ impl LexeBackend {
         })
     }
 
-    fn unpaid_or_pending(
+    fn response_without_payment(
         identifier: PaymentIdentifier,
         unit: CurrencyUnit,
-        attempted: bool,
+        status: MeltQuoteState,
     ) -> MakePaymentResponse {
         MakePaymentResponse {
             payment_lookup_id: identifier,
             payment_proof: None,
-            status: if attempted {
-                MeltQuoteState::Pending
-            } else {
-                MeltQuoteState::Unpaid
-            },
+            status,
             total_spent: Amount::new(0, unit),
         }
     }
@@ -533,9 +529,12 @@ impl MintPayment for LexeBackend {
             return self.check_outgoing_payment(&identifier).await;
         }
 
-        match tokio::time::timeout(
-            timeout,
-            self.wallet.pay_invoice(PayInvoiceRequest {
+        // Use one deadline for submission and settlement, not a fresh timeout
+        // for each phase. Persist acceptance before starting any status polls.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let index = match tokio::time::timeout_at(
+            deadline,
+            self.wallet.submit_invoice(PayInvoiceRequest {
                 invoice: lexe_invoice,
                 fallback_amount: None,
                 personal_note: None,
@@ -543,23 +542,43 @@ impl MintPayment for LexeBackend {
         )
         .await
         {
-            Ok(Ok(payment)) => {
+            Ok(Ok(index)) => index,
+            Ok(Err(SubmissionError::Rejected(e))) => {
                 self.db
-                    .insert_melt_payment_id(&payment_hash, &payment.index.to_string())
+                    .reject_melt_attempt(&payment_hash)
                     .map_err(|e| Error::Custom(e.to_string()))?;
-                Self::outgoing_response(identifier, unit, &payment)
+                tracing::warn!(error = %e, "Lexe payment submission was rejected");
+                return self.check_outgoing_payment(&identifier).await;
             }
+            Ok(Err(SubmissionError::Ambiguous(e))) => {
+                tracing::warn!(error = %e, "Lexe payment submission is ambiguous; reconciling");
+                return self.check_outgoing_payment(&identifier).await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    payment_hash = %hex::encode(payment_hash),
+                    ?timeout,
+                    "Lexe submission timed out; payment may still be in flight"
+                );
+                return self.check_outgoing_payment(&identifier).await;
+            }
+        };
+        self.db
+            .insert_melt_payment_id(&payment_hash, &index.to_string())
+            .map_err(|e| Error::Custom(e.to_string()))?;
+
+        match tokio::time::timeout_at(deadline, self.wallet.wait_for_payment(index)).await {
+            Ok(Ok(payment)) => Self::outgoing_response(identifier, unit, &payment),
             Ok(Err(e)) => {
-                // SDK errors can originate while polling an already accepted
-                // payment. They do not prove that submission failed.
-                tracing::warn!(error = %e, "Lexe payment result is ambiguous; reconciling");
+                // Even a typed auth/request error here occurred AFTER acceptance.
+                tracing::warn!(error = %e, "Lexe settlement lookup failed; reconciling");
                 self.check_outgoing_payment(&identifier).await
             }
             Err(_) => {
                 tracing::warn!(
                     payment_hash = %hex::encode(payment_hash),
                     ?timeout,
-                    "Lexe pay_invoice timed out; payment may still be in flight"
+                    "Lexe settlement timed out; payment may still be in flight"
                 );
                 self.check_outgoing_payment(&identifier).await
             }
@@ -708,18 +727,27 @@ impl MintPayment for LexeBackend {
             {
                 return Err(Error::Custom("Outgoing payment not found".into()));
             }
-            return Ok(Self::unpaid_or_pending(
+            return Ok(Self::response_without_payment(
                 payment_identifier.clone(),
                 CurrencyUnit::Sat,
-                false,
+                MeltQuoteState::Unpaid,
             ));
         };
 
-        if let Some(index) = self
+        let index = self
             .db
             .get_melt_payment_id(&payment_hash)
-            .map_err(|e| Error::Custom(e.to_string()))?
-        {
+            .map_err(|e| Error::Custom(e.to_string()))?;
+        if index.is_none() && attempt.submission_rejected {
+            // A rejected submission cannot settle. This result is durable and
+            // does not depend on history or on the node being reachable.
+            return Ok(Self::response_without_payment(
+                payment_identifier.clone(),
+                attempt.unit,
+                MeltQuoteState::Failed,
+            ));
+        }
+        if let Some(index) = index {
             if let Some(payment) = self.fetch_payment(&index).await? {
                 return Self::outgoing_response(
                     payment_identifier.clone(),
@@ -738,10 +766,10 @@ impl MintPayment for LexeBackend {
         }
 
         // Conservatively Pending: the invoice may still settle remotely.
-        Ok(Self::unpaid_or_pending(
+        Ok(Self::response_without_payment(
             payment_identifier.clone(),
             attempt.unit,
-            true,
+            MeltQuoteState::Pending,
         ))
     }
 }

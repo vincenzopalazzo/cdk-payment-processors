@@ -15,7 +15,9 @@ cdk-payment-processor = { version = "0.18.0", default-features = false }
 figment = { version = "0.10", features = ["env", "toml"] }
 futures = "0.3"
 hex = "0.4"
-lexe = "=0.1.22"
+# The pinned low-level client separates submission errors from settlement errors.
+lexe = { version = "=0.1.22", features = ["unstable"] }
+lexe-api-core = "=0.1.22"
 redb = "4.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an ambiguous attempt. Migrate legacy quote records conservatively.
 - Recover missing payment indexes across all history pages and match only
   outbound payments; reconcile SDK errors as well as timeouts.
+- Persist definite submission rejections as failed, including after retries
+  and restarts, instead of leaving payments with no remote record pending.
+  Separate submission from settlement using the pinned low-level SDK client,
+  save accepted indexes before polling, and keep polling failures and
+  unclassified submission errors ambiguous. Preserve older attempt records
+  conservatively and test both error phases and rejection persistence.
 - Replay cached payment updates on reconnect/restart, retry failed event
   mappings, and allow cancellation while the event queue is full.
 - Include Lexe in CI checks when the shared workflow changes.

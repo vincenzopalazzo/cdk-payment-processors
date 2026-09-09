@@ -609,6 +609,7 @@ dependencies = [
  "futures",
  "hex",
  "lexe",
+ "lexe-api-core",
  "redb",
  "serde",
  "serde_json",

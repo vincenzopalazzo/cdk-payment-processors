@@ -7,18 +7,25 @@ use lexe::types::command::{
     NodeInfo,
 };
 use lexe::types::util::TimestampMs;
+use lexe_api_core::error::{NodeApiError, NodeErrorKind};
 use std::sync::Mutex;
 
 #[derive(Default)]
 struct MockClient {
     payments: Mutex<Vec<Payment>>,
     outcome: Mutex<Option<Payment>>,
+    submission_error: Mutex<Option<NodeApiError>>,
+    settlement_error: Mutex<Option<NodeApiError>>,
     submissions: AtomicUsize,
+    settlement_polls: AtomicUsize,
+    lookups: AtomicUsize,
     syncs: AtomicUsize,
     pages: AtomicUsize,
     update_pages: AtomicUsize,
     block_submission: AtomicBool,
+    block_settlement: AtomicBool,
     submitted: tokio::sync::Notify,
+    settlement_started: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -34,20 +41,41 @@ impl LexeClient for MockClient {
         anyhow::bail!("unexpected create_invoice")
     }
 
-    async fn pay_invoice(&self, _: PayInvoiceRequest) -> anyhow::Result<Payment> {
+    async fn submit_invoice(
+        &self,
+        _: PayInvoiceRequest,
+    ) -> Result<PaymentCreatedIndex, SubmissionError> {
         self.submissions.fetch_add(1, Ordering::SeqCst);
         self.submitted.notify_one();
         if self.block_submission.load(Ordering::SeqCst) {
             return std::future::pending().await;
         }
-        let payment = self
-            .outcome
+        if let Some(error) = self.submission_error.lock().unwrap().clone() {
+            return Err(error.into());
+        }
+        let payment = self.outcome.lock().unwrap().clone().ok_or_else(|| {
+            SubmissionError::Ambiguous(anyhow!("connection lost after submission"))
+        })?;
+        self.payments.lock().unwrap().push(payment.clone());
+        Ok(payment.index)
+    }
+
+    async fn wait_for_payment(&self, index: PaymentCreatedIndex) -> anyhow::Result<Payment> {
+        self.settlement_polls.fetch_add(1, Ordering::SeqCst);
+        self.settlement_started.notify_one();
+        if self.block_settlement.load(Ordering::SeqCst) {
+            return std::future::pending().await;
+        }
+        if let Some(error) = self.settlement_error.lock().unwrap().clone() {
+            return Err(error.into());
+        }
+        self.payments
             .lock()
             .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow!("connection lost after submission"))?;
-        self.payments.lock().unwrap().push(payment.clone());
-        Ok(payment)
+            .iter()
+            .find(|p| p.index == index)
+            .cloned()
+            .ok_or_else(|| anyhow!("unexpected settlement lookup"))
     }
 
     async fn sync_payments(&self) -> anyhow::Result<()> {
@@ -78,6 +106,7 @@ impl LexeClient for MockClient {
     }
 
     async fn get_payment(&self, req: GetPaymentRequest) -> anyhow::Result<GetPaymentResponse> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
         Ok(GetPaymentResponse {
             payment: self
                 .payments
@@ -285,6 +314,251 @@ async fn prepared_quotes_remain_unpaid_across_restart() {
         MeltQuoteState::Unpaid
     );
     assert_eq!(client.syncs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn definite_submission_rejections_remain_failed_after_restart_and_retry() {
+    for kind in [
+        NodeErrorKind::Building,
+        NodeErrorKind::Connect,
+        NodeErrorKind::Rejection,
+        NodeErrorKind::ClientAuth,
+        NodeErrorKind::InsufficientScope,
+        NodeErrorKind::BadAuth,
+    ] {
+        let (backend, client, dir) = fixture();
+        *client.submission_error.lock().unwrap() = Some(NodeApiError {
+            kind,
+            ..Default::default()
+        });
+        let opts = options();
+        let response = backend
+            .make_payment(&CurrencyUnit::Sat, outgoing(&opts))
+            .await
+            .unwrap();
+        assert_eq!(response.status, MeltQuoteState::Failed);
+        assert_eq!(response.payment_lookup_id, identifier(&opts));
+        assert_eq!(response.total_spent, Amount::new(0, CurrencyUnit::Sat));
+        assert!(response.payment_proof.is_none());
+
+        drop(backend);
+        let backend = backend_at(client.clone(), dir.path());
+        let retry = options();
+        backend
+            .get_payment_quote(&CurrencyUnit::Sat, outgoing(&retry))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .check_outgoing_payment(&identifier(&opts))
+                .await
+                .unwrap()
+                .status,
+            MeltQuoteState::Failed
+        );
+        assert_eq!(
+            backend
+                .make_payment(&CurrencyUnit::Sat, outgoing(&retry))
+                .await
+                .unwrap()
+                .status,
+            MeltQuoteState::Failed
+        );
+        let attempt = backend
+            .db
+            .get_melt_attempt(&opts.bolt11.payment_hash().to_byte_array())
+            .unwrap()
+            .unwrap();
+        assert!(attempt.submission_rejected);
+        assert_eq!(attempt.quote_id, Some(opts.quote_id));
+        assert_eq!(client.submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(client.settlement_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(client.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(client.syncs.load(Ordering::SeqCst), 0);
+        assert_eq!(client.pages.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn command_errors_do_not_prove_rejection_even_without_remote_history() {
+    let (backend, client, dir) = fixture();
+    *client.submission_error.lock().unwrap() = Some(NodeApiError {
+        kind: NodeErrorKind::Command,
+        msg: "Payment already exists".into(),
+        ..Default::default()
+    });
+    let opts = options();
+    assert_eq!(
+        backend
+            .make_payment(&CurrencyUnit::Sat, outgoing(&opts))
+            .await
+            .unwrap()
+            .status,
+        MeltQuoteState::Pending
+    );
+    drop(backend);
+    let backend = backend_at(client.clone(), dir.path());
+    assert_eq!(
+        backend
+            .make_payment(&CurrencyUnit::Sat, outgoing(&opts))
+            .await
+            .unwrap()
+            .status,
+        MeltQuoteState::Pending
+    );
+    client.payments.lock().unwrap().push(payment(
+        0,
+        PaymentDirection::Outbound,
+        opts.bolt11.payment_hash().to_byte_array(),
+    ));
+    assert_eq!(
+        backend
+            .check_outgoing_payment(&identifier(&opts))
+            .await
+            .unwrap()
+            .status,
+        MeltQuoteState::Paid
+    );
+    assert_eq!(client.submissions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn accepted_payment_polling_errors_are_not_submission_rejections() {
+    for kind in [
+        NodeErrorKind::BadAuth,
+        NodeErrorKind::Rejection,
+        NodeErrorKind::Connect,
+    ] {
+        let (backend, client, dir) = fixture();
+        let opts = options();
+        let hash = opts.bolt11.payment_hash().to_byte_array();
+        let mut pending = payment(0, PaymentDirection::Outbound, hash);
+        pending.status = PaymentStatus::Pending;
+        *client.outcome.lock().unwrap() = Some(pending.clone());
+        *client.settlement_error.lock().unwrap() = Some(NodeApiError {
+            kind,
+            ..Default::default()
+        });
+        assert_eq!(
+            backend
+                .make_payment(&CurrencyUnit::Sat, outgoing(&opts))
+                .await
+                .unwrap()
+                .status,
+            MeltQuoteState::Pending
+        );
+        drop(backend);
+        let backend = backend_at(client.clone(), dir.path());
+        assert_eq!(
+            backend.db.get_melt_payment_id(&hash).unwrap(),
+            Some(pending.index.to_string())
+        );
+        assert!(
+            !backend
+                .db
+                .get_melt_attempt(&hash)
+                .unwrap()
+                .unwrap()
+                .submission_rejected
+        );
+        assert_eq!(
+            backend
+                .make_payment(&CurrencyUnit::Sat, outgoing(&opts))
+                .await
+                .unwrap()
+                .status,
+            MeltQuoteState::Pending
+        );
+        client.payments.lock().unwrap()[0].status = PaymentStatus::Completed;
+        assert_eq!(
+            backend
+                .check_outgoing_payment(&identifier(&opts))
+                .await
+                .unwrap()
+                .status,
+            MeltQuoteState::Paid
+        );
+        assert_eq!(client.submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(client.settlement_polls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn accepted_index_is_durable_before_a_cancelled_settlement_wait() {
+    let (backend, client, dir) = fixture();
+    let backend = Arc::new(backend);
+    let opts = options();
+    let hash = opts.bolt11.payment_hash().to_byte_array();
+    let mut pending = payment(0, PaymentDirection::Outbound, hash);
+    pending.status = PaymentStatus::Pending;
+    *client.outcome.lock().unwrap() = Some(pending.clone());
+    client.block_settlement.store(true, Ordering::SeqCst);
+    let first = {
+        let backend = backend.clone();
+        let opts = opts.clone();
+        tokio::spawn(async move {
+            backend
+                .make_payment(&CurrencyUnit::Sat, outgoing(&opts))
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(2), client.settlement_started.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.db.get_melt_payment_id(&hash).unwrap(),
+        Some(pending.index.to_string())
+    );
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    drop(backend);
+    let backend = backend_at(client.clone(), dir.path());
+    assert_eq!(
+        backend
+            .make_payment(&CurrencyUnit::Sat, outgoing(&opts))
+            .await
+            .unwrap()
+            .status,
+        MeltQuoteState::Pending
+    );
+    assert_eq!(client.submissions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn settlement_timeout_preserves_acceptance_for_recovery() {
+    let (mut backend, client, dir) = fixture();
+    backend.payment_timeout = Duration::from_millis(1);
+    let opts = options();
+    let hash = opts.bolt11.payment_hash().to_byte_array();
+    let mut pending = payment(0, PaymentDirection::Outbound, hash);
+    pending.status = PaymentStatus::Pending;
+    *client.outcome.lock().unwrap() = Some(pending.clone());
+    client.block_settlement.store(true, Ordering::SeqCst);
+    assert_eq!(
+        backend
+            .make_payment(&CurrencyUnit::Sat, outgoing(&opts))
+            .await
+            .unwrap()
+            .status,
+        MeltQuoteState::Pending
+    );
+    drop(backend);
+    let backend = backend_at(client.clone(), dir.path());
+    assert_eq!(
+        backend.db.get_melt_payment_id(&hash).unwrap(),
+        Some(pending.index.to_string())
+    );
+    client.payments.lock().unwrap()[0].status = PaymentStatus::Completed;
+    assert_eq!(
+        backend
+            .make_payment(&CurrencyUnit::Sat, outgoing(&opts))
+            .await
+            .unwrap()
+            .status,
+        MeltQuoteState::Paid
+    );
+    assert_eq!(client.submissions.load(Ordering::SeqCst), 1);
+    assert_eq!(client.settlement_polls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
