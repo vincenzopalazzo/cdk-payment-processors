@@ -62,22 +62,46 @@ async fn main() -> Result<()> {
             }
         });
 
-    let serve_task = tokio::spawn(server);
+    let mut serve_task = tokio::spawn(server);
 
-    // Fail fast instead of serving nothing if the gRPC endpoint is not really
-    // reachable (e.g. a conflicting listener raced us to the port).
+    // Fail fast instead of serving nothing if the gRPC endpoint is not
+    // really reachable (e.g. a conflicting listener raced us to the port).
+    // If the server task dies while the probe is running, surface its real
+    // error instead of masking it behind a self-check failure.
     if !cfg.tls_enable {
-        self_check(socket_addr).await?;
+        tokio::select! {
+            serve_result = &mut serve_task => {
+                finish_serve(serve_result)?;
+            }
+            check_result = self_check(socket_addr) => {
+                check_result?;
+            }
+        }
     } else {
-        tracing::info!("TLS enabled: skipping plaintext self-check");
+        tracing::info!(
+            "TLS enabled: skipping plaintext self-check (an mTLS endpoint \
+             cannot be probed without a client certificate)"
+        );
     }
 
-    match serve_task.await {
-        Ok(Ok(())) => tracing::info!("Server stopped gracefully"),
-        Ok(Err(e)) => return Err(e).context("gRPC server failed"),
-        Err(e) => return Err(e).context("gRPC server task panicked"),
-    }
+    finish_serve(serve_task.await)?;
     Ok(())
+}
+
+fn finish_serve(
+    result: std::result::Result<
+        std::result::Result<(), tonic::transport::Error>,
+        tokio::task::JoinError,
+    >,
+) -> Result<()> {
+    match result {
+        Ok(Ok(())) => {
+            tracing::info!("Server stopped gracefully");
+            Ok(())
+        }
+        Ok(Err(error)) => Err(error).context("gRPC server failed"),
+        Err(error) => Err(error).context("gRPC server task panicked"),
+    }
 }
 
 /// Verify our own gRPC service answers GetSettings from the local host.

@@ -16,7 +16,7 @@ const NETWORKS: &[&str] = &["mainnet", "testnet3", "regtest"];
 ///
 /// Credentials follow the same model as lexe-mcp: a single base64
 /// "client credentials" blob created in the Lexe app (Menu → SDK clients).
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct BackendConfig {
     /// Base64 Lexe SDK client credentials (Lexe app → Menu → SDK clients).
     ///
@@ -50,6 +50,28 @@ pub struct BackendConfig {
     /// above that.
     #[serde(default = "default_payment_timeout_secs")]
     pub payment_timeout_secs: u64,
+}
+
+/// `client_credentials` and `seed_phrase` are credential material, so they
+/// are redacted in the (manually implemented) debug output.
+impl std::fmt::Debug for BackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendConfig")
+            .field(
+                "client_credentials",
+                &self.client_credentials.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "seed_phrase",
+                &self.seed_phrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("network", &self.network)
+            .field("data_dir", &self.data_dir)
+            .field("fee_reserve_ppm", &self.fee_reserve_ppm)
+            .field("fee_reserve_min_sat", &self.fee_reserve_min_sat)
+            .field("payment_timeout_secs", &self.payment_timeout_secs)
+            .finish()
+    }
 }
 
 fn default_network() -> String {
@@ -152,31 +174,37 @@ impl Config {
     /// Load from config.toml (if present) and environment variables.
     /// Environment variables override file values.
     pub fn load() -> Result<Self> {
-        let cfg = extract_config(config_figment())?;
-        validate(&cfg)?;
-        Ok(cfg)
+        let mut figment = Figment::from(Serialized::defaults(Config::default()));
+        if std::path::Path::new("config.toml").is_file() {
+            figment = figment.merge(Toml::file_exact("config.toml"));
+        }
+        Self::from_figment(figment)
+    }
+
+    /// Load from environment variables only, ignoring any local
+    /// `config.toml`, so unit tests do not depend on the working directory.
+    pub fn load_env_only() -> Result<Self> {
+        Self::from_figment(Figment::from(Serialized::defaults(Config::default())))
     }
 
     /// Alias for [`Self::load`].
     pub fn from_env() -> Result<Self> {
         Self::load()
     }
-}
 
-fn config_figment() -> Figment {
-    let mut figment = Figment::from(Serialized::defaults(Config::default()));
-    if std::path::Path::new("config.toml").is_file() {
-        figment = figment.merge(Toml::file_exact("config.toml"));
+    fn from_figment(figment: Figment) -> Result<Self> {
+        let figment = figment
+            .merge(Env::prefixed("SERVER_"))
+            .merge(Env::prefixed("TLS_").map(|key| format!("tls_{}", key.as_str()).into()))
+            .merge(Env::raw().only(&["ALLOW_INSECURE"]))
+            .merge(
+                Env::prefixed(BACKEND_ENV_PREFIX)
+                    .map(|key| format!("{BACKEND_CONFIG_SECTION}.{}", key.as_str()).into()),
+            );
+        let cfg = extract_config(figment)?;
+        validate(&cfg)?;
+        Ok(cfg)
     }
-
-    figment
-        .merge(Env::prefixed("SERVER_"))
-        .merge(Env::prefixed("TLS_").map(|key| format!("tls_{}", key.as_str()).into()))
-        .merge(Env::raw().only(&["ALLOW_INSECURE"]))
-        .merge(
-            Env::prefixed(BACKEND_ENV_PREFIX)
-                .map(|key| format!("{BACKEND_CONFIG_SECTION}.{}", key.as_str()).into()),
-        )
 }
 
 fn extract_config(figment: Figment) -> Result<Config> {
@@ -261,7 +289,7 @@ mod tests {
         let _guard = env_lock();
         clear_test_env();
 
-        let err = Config::load().unwrap_err();
+        let err = Config::load_env_only().unwrap_err();
         assert!(
             err.to_string().contains("missing credentials"),
             "unexpected error: {err}"
@@ -274,7 +302,7 @@ mod tests {
         clear_test_env();
         std::env::set_var("LEXE_CLIENT_CREDENTIALS", "dGVzdA==");
 
-        let cfg = Config::load().expect("should load with client credentials");
+        let cfg = Config::load_env_only().expect("should load with client credentials");
         assert_eq!(cfg.lexe.client_credentials.as_deref(), Some("dGVzdA=="));
         assert_eq!(cfg.lexe.network, "mainnet");
         assert_eq!(cfg.lexe.data_dir, ".data/lexe");
@@ -290,7 +318,7 @@ mod tests {
         clear_test_env();
         std::env::set_var("LEXE_SEED_PHRASE", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
 
-        let cfg = Config::load().expect("should load with seed phrase");
+        let cfg = Config::load_env_only().expect("should load with seed phrase");
         assert!(cfg.lexe.client_credentials.is_none());
         assert!(cfg.lexe.seed_phrase.is_some());
         clear_test_env();
@@ -303,7 +331,7 @@ mod tests {
         std::env::set_var("LEXE_CLIENT_CREDENTIALS", "dGVzdA==");
         std::env::set_var("LEXE_SEED_PHRASE", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
 
-        let err = Config::load().unwrap_err();
+        let err = Config::load_env_only().unwrap_err();
         assert!(
             err.to_string().contains("not both"),
             "unexpected error: {err}"
@@ -318,7 +346,7 @@ mod tests {
         std::env::set_var("LEXE_CLIENT_CREDENTIALS", "dGVzdA==");
         std::env::set_var("LEXE_NETWORK", "signet");
 
-        let err = Config::load().unwrap_err();
+        let err = Config::load_env_only().unwrap_err();
         assert!(
             err.to_string().contains("invalid LEXE_NETWORK"),
             "unexpected error: {err}"
@@ -337,7 +365,7 @@ mod tests {
         std::env::set_var("SERVER_PORT", "60001");
         std::env::set_var("ALLOW_INSECURE", "true");
 
-        let cfg = Config::load().expect("should load with env overrides");
+        let cfg = Config::load_env_only().expect("should load with env overrides");
         assert_eq!(cfg.lexe.network, "testnet3");
         assert_eq!(cfg.lexe.data_dir, "/tmp/lexe-data");
         assert_eq!(cfg.lexe.fee_reserve_ppm, 250);
@@ -353,7 +381,20 @@ mod tests {
         std::env::set_var("LEXE_CLIENT_CREDENTIALS", "dGVzdA==");
         std::env::set_var("SERVER_PORT", "not-a-port");
 
-        assert!(Config::load().is_err());
+        assert!(Config::load_env_only().is_err());
         clear_test_env();
+    }
+
+    #[test]
+    fn debug_output_redacts_credentials() {
+        let config = BackendConfig {
+            client_credentials: Some("top-secret-blob".to_string()),
+            ..BackendConfig::default()
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("top-secret-blob"));
     }
 }

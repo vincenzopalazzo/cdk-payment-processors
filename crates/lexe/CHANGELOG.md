@@ -53,6 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conservatively and test both error phases and rejection persistence.
 - Replay cached payment updates on reconnect/restart, retry failed event
   mappings, and allow cancellation while the event queue is full.
+- Surface an error instead of reporting a zero amount when a settled
+  payment's amount cannot be determined (inbound status checks and event
+  mapping), and persist the mint invoice + payment index in one
+  transaction so a crash cannot leave a dangling invoice.
+- Fail startup on seed-phrase signup failure (signup is idempotent),
+  report the server's real bind error when the plaintext self-check races
+  a dying server task, and redact credentials in debug output (tests load
+  env-only config so they do not depend on a local `config.toml`).
 - Include Lexe in CI checks when the shared workflow changes.
 - Correct configuration examples and document TLS self-check behavior.
 - Add mocked payment lifecycle tests and database migration/concurrency tests.

@@ -115,6 +115,30 @@ impl QuoteDatabase {
         self.insert_mapping(MINT_PAYMENT_IDS_TABLE, payment_hash, payment_index)
     }
 
+    /// Store a created mint invoice and its Lexe payment index in a single
+    /// transaction, so a crash between the two writes cannot leave an
+    /// invoice without a payment index.
+    pub fn insert_mint_mappings(
+        &self,
+        payment_hash: &[u8; 32],
+        payment_request: &str,
+        payment_index: &str,
+    ) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut quotes = write_txn.open_table(MINT_QUOTES_TABLE)?;
+            quotes.insert(payment_hash, payment_request)?;
+            let mut payment_ids = write_txn.open_table(MINT_PAYMENT_IDS_TABLE)?;
+            payment_ids.insert(payment_hash, payment_index)?;
+        }
+        write_txn.commit()?;
+        tracing::debug!(
+            "Inserted lexe mint mappings for payment hash {}",
+            hex::encode(payment_hash)
+        );
+        Ok(())
+    }
+
     /// Get the Lexe payment index for a created invoice.
     pub fn get_mint_payment_id(&self, payment_hash: &[u8; 32]) -> Result<Option<String>> {
         self.get_mapping(MINT_PAYMENT_IDS_TABLE, payment_hash)
@@ -434,5 +458,28 @@ mod tests {
         }
         let db = QuoteDatabase::new(&path).unwrap();
         assert!(db.get_melt_attempt(&[3; 32]).unwrap().is_none());
+    }
+
+    #[test]
+    fn mint_mappings_written_in_single_call() {
+        let path = test_db_path();
+        let hash = [13_u8; 32];
+
+        let db = QuoteDatabase::new(&path).expect("create quote database");
+        db.insert_mint_mappings(&hash, "lnbc1incoming-invoice", "0001-ln_aabbcc")
+            .expect("insert mint mappings");
+
+        assert_eq!(
+            db.get_mint_quote(&hash).expect("get mint invoice"),
+            Some("lnbc1incoming-invoice".to_string())
+        );
+        assert_eq!(
+            db.get_mint_payment_id(&hash)
+                .expect("get mint payment index"),
+            Some("0001-ln_aabbcc".to_string())
+        );
+
+        drop(db);
+        std::fs::remove_file(path).expect("remove quote database");
     }
 }

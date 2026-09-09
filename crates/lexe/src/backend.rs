@@ -181,13 +181,14 @@ impl LexeBackend {
                         .map_err(|e| {
                             Error::Custom(format!("failed to initialize Lexe wallet: {e}"))
                         })?;
-                        match wallet.signup(&root_seed, None).await {
-                            Ok(()) => tracing::info!("Signed up new Lexe node from seed phrase"),
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                "Lexe signup failed; continuing (node may already be signed up)"
-                            ),
-                        }
+                        // Signup is idempotent per the SDK, so it is safe to
+                        // fail closed: a restart will retry, while
+                        // provisioning a half-initialized node is not.
+                        wallet
+                            .signup(&root_seed, None)
+                            .await
+                            .map_err(|e| Error::Custom(format!("Lexe signup failed: {e}")))?;
+                        tracing::info!("Signed up new Lexe node from seed phrase");
                         wallet
                     }
                 };
@@ -424,11 +425,10 @@ impl MintPayment for LexeBackend {
         let parsed = Bolt11Invoice::from_str(&invoice)?;
         let payment_hash = parsed.payment_hash().to_byte_array();
 
+        // Write both mint mappings in one transaction so a crash cannot
+        // leave an invoice without its payment index.
         self.db
-            .insert_mint_quote(&payment_hash, &invoice)
-            .map_err(|e| Error::Custom(e.to_string()))?;
-        self.db
-            .insert_mint_payment_id(&payment_hash, &response.index.to_string())
+            .insert_mint_mappings(&payment_hash, &invoice, &response.index.to_string())
             .map_err(|e| Error::Custom(e.to_string()))?;
 
         Ok(CreateIncomingPaymentResponse {
@@ -690,16 +690,25 @@ impl MintPayment for LexeBackend {
             return Ok(vec![]);
         }
 
-        let amount_sats = payment.amount.map(|a| a.sats_u64()).unwrap_or_else(|| {
-            self.db
-                .get_mint_quote(payment_hash)
-                .ok()
-                .flatten()
-                .and_then(|invoice| Bolt11Invoice::from_str(&invoice).ok())
-                .and_then(|invoice| invoice.amount_milli_satoshis())
-                .map(|msat| msat.div_ceil(1000))
-                .unwrap_or(0)
-        });
+        let amount_sats = payment
+            .amount
+            .map(|a| a.sats_u64())
+            .or_else(|| {
+                self.db
+                    .get_mint_quote(payment_hash)
+                    .ok()
+                    .flatten()
+                    .and_then(|invoice| Bolt11Invoice::from_str(&invoice).ok())
+                    .and_then(|invoice| invoice.amount_milli_satoshis())
+                    .map(|msat| msat.div_ceil(1000))
+            })
+            .ok_or_else(|| {
+                Error::Custom(format!(
+                    "inbound payment {} is completed but its amount cannot \
+                     be determined",
+                    payment.index
+                ))
+            })?;
 
         Ok(vec![WaitPaymentResponse {
             payment_id: payment.index.to_string(),
@@ -816,7 +825,12 @@ fn map_payment_event(db: &QuoteDatabase, payment: &Payment) -> Result<Option<Eve
             {
                 return Ok(None);
             }
-            let amount_sats = payment.amount.map(|a| a.sats_u64()).unwrap_or_default();
+            let amount_sats = payment.amount.map(|a| a.sats_u64()).ok_or_else(|| {
+                Error::Custom(format!(
+                    "inbound payment {} completed without an amount",
+                    payment.index
+                ))
+            })?;
             Ok(Some(Event::PaymentReceived(WaitPaymentResponse {
                 payment_id: payment.index.to_string(),
                 payment_identifier: PaymentIdentifier::PaymentHash(hash),
@@ -1144,6 +1158,100 @@ mod tests {
         );
         assert!(map_payment_event(&db, &payment).unwrap().is_none());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn completed_inbound_without_amount_is_an_error() {
+        let path = test_event_db_path();
+        let db = QuoteDatabase::new(&path).expect("create quote database");
+        let hash = [14_u8; 32];
+        db.insert_mint_quote(&hash, "lnbc1incoming-invoice")
+            .expect("insert mint quote");
+
+        let mut payment = test_payment(
+            PaymentDirection::Inbound,
+            PaymentStatus::Completed,
+            hash,
+            21_000,
+            0,
+            "received",
+        );
+        payment.amount = None;
+
+        assert!(
+            map_payment_event(&db, &payment).is_err(),
+            "a settled inbound payment without an amount must not be emitted as zero"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn completed_outbound_without_amount_is_an_error() {
+        let path = test_event_db_path();
+        let db = QuoteDatabase::new(&path).expect("create quote database");
+        let hash = [15_u8; 32];
+        let quote_id: QuoteId = "018f8b3e-8c1a-7d2e-9f4b-6a1c3e5d7f92"
+            .parse()
+            .expect("valid quote id");
+        db.begin_melt_attempt(&hash, &quote_id, &CurrencyUnit::Sat)
+            .expect("begin melt attempt");
+
+        let mut payment = test_payment(
+            PaymentDirection::Outbound,
+            PaymentStatus::Completed,
+            hash,
+            5_000,
+            3,
+            "settled",
+        );
+        payment.amount = None;
+
+        assert!(
+            map_payment_event(&db, &payment).is_err(),
+            "a settled outbound payment without an amount must not settle at zero"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn outgoing_response_paid_reports_amount_plus_fees() {
+        let payment = test_payment(
+            PaymentDirection::Outbound,
+            PaymentStatus::Completed,
+            [16_u8; 32],
+            5_000,
+            3,
+            "settled",
+        );
+        let response = LexeBackend::outgoing_response(
+            PaymentIdentifier::PaymentHash([16_u8; 32]),
+            &CurrencyUnit::Sat,
+            &payment,
+        )
+        .expect("paid melt with an amount is reported");
+        assert_eq!(response.status, MeltQuoteState::Paid);
+        assert_eq!(response.total_spent.to_sat().expect("sat unit"), 5_003);
+        assert!(response.payment_proof.is_some());
+    }
+
+    #[test]
+    fn outgoing_response_paid_without_amount_is_an_error() {
+        let mut payment = test_payment(
+            PaymentDirection::Outbound,
+            PaymentStatus::Completed,
+            [17_u8; 32],
+            5_000,
+            3,
+            "settled",
+        );
+        payment.amount = None;
+
+        assert!(LexeBackend::outgoing_response(
+            PaymentIdentifier::PaymentHash([17_u8; 32]),
+            &CurrencyUnit::Sat,
+            &payment,
+        )
+        .is_err());
     }
 }
 

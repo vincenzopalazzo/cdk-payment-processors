@@ -4,7 +4,8 @@
 address = "127.0.0.1"
 port = 50051
 
-# TLS configuration (optional)
+# TLS (mTLS) configuration. With TLS disabled the server only starts when
+# allow_insecure is set to true explicitly.
 tls_enable = false
 allow_insecure = true
 tls_cert_path = "certs/server.crt"
