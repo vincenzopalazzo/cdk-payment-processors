@@ -283,16 +283,6 @@ fn fractional_principal_and_fee_are_summed_before_rounding() {
         )
         .unwrap();
         assert_eq!(result.total_spent, Amount::new(sats, CurrencyUnit::Sat));
-        let legacy = LexeBackend::outgoing_response(
-            PaymentIdentifier::PaymentHash([1; 32]),
-            &CurrencyUnit::Msat,
-            &paid,
-        )
-        .unwrap();
-        assert_eq!(
-            legacy.total_spent,
-            Amount::new(principal + fee, CurrencyUnit::Msat)
-        );
     }
 }
 
@@ -722,7 +712,10 @@ async fn recovery_searches_past_500_records_and_ignores_inbound_matches() {
 async fn reconnect_replays_cached_payments_including_the_unconsumed_batch() {
     let (backend, client, _dir) = fixture();
     for n in 1..=3u8 {
-        backend.db.insert_mint_quote(&[n; 32], "invoice").unwrap();
+        backend
+            .db
+            .insert_mint_quote_and_payment_id(&[n; 32], "invoice", "idx")
+            .unwrap();
         client.payments.lock().unwrap().push(payment(
             u32::from(n),
             PaymentDirection::Inbound,
@@ -757,7 +750,10 @@ async fn reconnect_replays_cached_payments_including_the_unconsumed_batch() {
 async fn cancellation_interrupts_a_full_event_queue() {
     let (backend, client, _dir) = fixture();
     for n in 1..=150u8 {
-        backend.db.insert_mint_quote(&[n; 32], "invoice").unwrap();
+        backend
+            .db
+            .insert_mint_quote_and_payment_id(&[n; 32], "invoice", "idx")
+            .unwrap();
         client.payments.lock().unwrap().push(payment(
             u32::from(n),
             PaymentDirection::Inbound,

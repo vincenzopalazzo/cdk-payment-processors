@@ -39,10 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Sum outgoing principal and fees in millisatoshis before rounding the total
-  up for sat quotes; preserve exact msat totals for legacy attempts.
+  up for sat quotes; reject fractional-msat invoices, since Lexe invoices
+  are whole sats.
 - Atomically persist submission intent and the original quote's event owner;
   unused quotes stay unpaid and concurrent/restarted retries never resubmit
-  an ambiguous attempt. Migrate legacy quote records conservatively.
+  an ambiguous attempt.
 - Recover missing payment indexes across all history pages and match only
   outbound payments; reconcile SDK errors as well as timeouts.
 - Persist definite submission rejections as failed, including after retries
@@ -63,4 +64,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   env-only config so they do not depend on a local `config.toml`).
 - Include Lexe in CI checks when the shared workflow changes.
 - Correct configuration examples and document TLS self-check behavior.
-- Add mocked payment lifecycle tests and database migration/concurrency tests.
+- Add mocked payment lifecycle tests and database concurrency tests. The
+  schema is fresh (no migration); the `melt_attempts` claim is the single
+  serialization point.

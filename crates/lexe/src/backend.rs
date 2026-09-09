@@ -279,7 +279,12 @@ impl LexeBackend {
         let amount_msat = invoice
             .amount_milli_satoshis()
             .ok_or(Error::AmountMismatch)?;
-        let amount_sats = amount_msat.div_ceil(1000);
+        // Lexe invoices are whole sats; a fractional-msat invoice cannot be
+        // paid exactly.
+        if amount_msat % 1000 != 0 {
+            return Err(Error::AmountMismatch);
+        }
+        let amount_sats = amount_msat / 1000;
         if amount_sats == 0 {
             return Err(Error::AmountMismatch);
         }
@@ -314,12 +319,8 @@ impl LexeBackend {
                 .msat()
                 .checked_add(payment.fees.msat())
                 .ok_or_else(|| Error::Custom("Lexe payment total overflow".into()))?;
-            match unit {
-                CurrencyUnit::Sat => Amount::new(msats.div_ceil(1000), CurrencyUnit::Sat),
-                // Preserve the precision of attempts migrated from older versions.
-                CurrencyUnit::Msat => Amount::new(msats, CurrencyUnit::Msat),
-                _ => return Err(Error::UnsupportedUnit),
-            }
+            // ensure_supported_unit only accepts `sat`; report whole sats.
+            Amount::new(msats.div_ceil(1000), CurrencyUnit::Sat)
         } else {
             Amount::new(0, unit.clone())
         };
@@ -428,7 +429,7 @@ impl MintPayment for LexeBackend {
         // Write both mint mappings in one transaction so a crash cannot
         // leave an invoice without its payment index.
         self.db
-            .insert_mint_mappings(&payment_hash, &invoice, &response.index.to_string())
+            .insert_mint_quote_and_payment_id(&payment_hash, &invoice, &response.index.to_string())
             .map_err(|e| Error::Custom(e.to_string()))?;
 
         Ok(CreateIncomingPaymentResponse {
@@ -485,6 +486,8 @@ impl MintPayment for LexeBackend {
         let payment_hash = opts.bolt11.payment_hash().to_byte_array();
         let identifier = PaymentIdentifier::PaymentHash(payment_hash);
 
+        // Record the invoice so a payment refused below still reads as a
+        // known, unpaid quote instead of "not found".
         self.db
             .insert_melt_quote(&payment_hash, &invoice)
             .map_err(|e| Error::Custom(e.to_string()))?;
@@ -690,25 +693,12 @@ impl MintPayment for LexeBackend {
             return Ok(vec![]);
         }
 
-        let amount_sats = payment
-            .amount
-            .map(|a| a.sats_u64())
-            .or_else(|| {
-                self.db
-                    .get_mint_quote(payment_hash)
-                    .ok()
-                    .flatten()
-                    .and_then(|invoice| Bolt11Invoice::from_str(&invoice).ok())
-                    .and_then(|invoice| invoice.amount_milli_satoshis())
-                    .map(|msat| msat.div_ceil(1000))
-            })
-            .ok_or_else(|| {
-                Error::Custom(format!(
-                    "inbound payment {} is completed but its amount cannot \
-                     be determined",
-                    payment.index
-                ))
-            })?;
+        let amount_sats = payment.amount.map(|a| a.sats_u64()).ok_or_else(|| {
+            Error::Custom(format!(
+                "inbound payment {} is completed but its amount cannot be determined",
+                payment.index
+            ))
+        })?;
 
         Ok(vec![WaitPaymentResponse {
             payment_id: payment.index.to_string(),
@@ -894,6 +884,19 @@ mod tests {
     }
 
     #[test]
+    fn invoice_amount_is_whole_sats() {
+        // lnbc100n = 10 sats = 10_000 msat.
+        let invoice = Bolt11Invoice::from_str(
+            "lnbc100n1p5z3a63pp56854ytysg7e5z9fl3w5mgvrlqjfcytnjv8ff5hm5qt6gl6alxesqdqqcqzzsxqyz5vqsp5p0x0dlhn27s63j4emxnk26p7f94u0lyarnfp5yqmac9gzy4ngdss9qxpqysgqne3v0hnzt2lp0hc69xpzckk0cdcar7glvjhq60lsrfe8gejdm8c564prrnsft6ctxxyrewp4jtezrq3gxxqnfjj0f9tw2qs9y0lslmqpfu7et9",
+        )
+        .expect("valid invoice");
+        assert_eq!(
+            LexeBackend::invoice_amount_sats(&invoice).expect("whole-sat amount"),
+            10
+        );
+    }
+
+    #[test]
     fn maps_lex_statuses_to_melt_states() {
         assert_eq!(
             LexeBackend::melt_status(PaymentStatus::Completed),
@@ -998,7 +1001,7 @@ mod tests {
         let path = test_event_db_path();
         let db = QuoteDatabase::new(&path).expect("create quote database");
         let hash = [7_u8; 32];
-        db.insert_mint_quote(&hash, "lnbc1incoming-invoice")
+        db.insert_mint_quote_and_payment_id(&hash, "lnbc1incoming-invoice", "0001-ln_test")
             .expect("insert mint quote");
 
         let payment = test_payment(
@@ -1034,7 +1037,7 @@ mod tests {
         let db = QuoteDatabase::new(&path).expect("create quote database");
         let ours = [10_u8; 32];
         let foreign = [11_u8; 32];
-        db.insert_mint_quote(&ours, "lnbc1incoming-invoice")
+        db.insert_mint_quote_and_payment_id(&ours, "lnbc1incoming-invoice", "0001-ln_test")
             .expect("insert mint quote");
 
         // Settled, but for an invoice this processor did not create.
@@ -1069,8 +1072,8 @@ mod tests {
         let quote_id: QuoteId = "018f8b3e-8c1a-7d2e-9f4b-6a1c3e5d7f90"
             .parse()
             .expect("valid quote id");
-        db.begin_melt_attempt(&hash, &quote_id, &CurrencyUnit::Msat)
-            .expect("insert melt quote id");
+        db.begin_melt_attempt(&hash, &quote_id, &CurrencyUnit::Sat)
+            .expect("begin melt attempt");
 
         let payment = test_payment(
             PaymentDirection::Outbound,
@@ -1090,11 +1093,8 @@ mod tests {
             } => {
                 assert_eq!(event_quote_id, quote_id);
                 assert_eq!(details.status, MeltQuoteState::Paid);
-                // msat unit: 5003 sats -> 5_003_000 msats
-                assert_eq!(
-                    details.total_spent.to_msat().expect("msat amount"),
-                    5_003_000
-                );
+                // 5000 sats principal + 3 sats fee
+                assert_eq!(details.total_spent.to_sat().expect("sat amount"), 5_003);
                 assert!(details.payment_proof.is_some());
             }
             other => panic!("expected PaymentSuccessful, got {other:?}"),
@@ -1165,7 +1165,7 @@ mod tests {
         let path = test_event_db_path();
         let db = QuoteDatabase::new(&path).expect("create quote database");
         let hash = [14_u8; 32];
-        db.insert_mint_quote(&hash, "lnbc1incoming-invoice")
+        db.insert_mint_quote_and_payment_id(&hash, "lnbc1incoming-invoice", "0001-ln_test")
             .expect("insert mint quote");
 
         let mut payment = test_payment(

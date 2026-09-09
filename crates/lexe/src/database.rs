@@ -29,24 +29,16 @@ const MELT_QUOTES_TABLE: TableDefinition<&[u8; 32], &str> = TableDefinition::new
 const MELT_PAYMENT_IDS_TABLE: TableDefinition<&[u8; 32], &str> =
     TableDefinition::new("melt_payment_ids");
 
-/// CDK melt quote id + quote unit, keyed by payment hash, as JSON
-/// `{"quote_id": "...", "unit": "sat"|"msat"|...}` for event correlation.
-const MELT_QUOTE_IDS_TABLE: TableDefinition<&[u8; 32], &str> =
-    TableDefinition::new("melt_quote_ids");
-
 const MELT_ATTEMPTS_TABLE: TableDefinition<&[u8; 32], &str> = TableDefinition::new("melt_attempts");
-const METADATA_TABLE: TableDefinition<&str, bool> = TableDefinition::new("metadata");
 
 /// Durable submission intent. Its owner is immutable, including on retries.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MeltAttempt {
-    /// Legacy records without an event mapping cannot be assigned a new owner.
+    /// Event owner for this melt.
     pub quote_id: Option<QuoteId>,
-    /// Unit in which the original attempt was requested.
+    /// Unit in which the attempt was requested.
     pub unit: CurrencyUnit,
     /// True only when submission was definitively rejected, before acceptance.
-    /// Older attempts lack this field and must remain ambiguous.
-    #[serde(default)]
     pub submission_rejected: bool,
 }
 
@@ -63,31 +55,11 @@ impl QuoteDatabase {
 
         let write_txn = db.begin_write()?;
         {
-            let _mint_quotes = write_txn.open_table(MINT_QUOTES_TABLE)?;
-            let _mint_payment_ids = write_txn.open_table(MINT_PAYMENT_IDS_TABLE)?;
-            let melt_quotes = write_txn.open_table(MELT_QUOTES_TABLE)?;
-            let _melt_payment_ids = write_txn.open_table(MELT_PAYMENT_IDS_TABLE)?;
-            let melt_quote_ids = write_txn.open_table(MELT_QUOTE_IDS_TABLE)?;
-            let mut attempts = write_txn.open_table(MELT_ATTEMPTS_TABLE)?;
-            let mut metadata = write_txn.open_table(METADATA_TABLE)?;
-            if metadata.get("attempts_migrated")?.is_none() {
-                // The old schema did not distinguish quotes from submissions.
-                // Never turn a possibly paid legacy quote into a fresh attempt.
-                for entry in melt_quotes.iter()? {
-                    let (hash, _) = entry?;
-                    let attempt = match melt_quote_ids.get(hash.value())? {
-                        Some(raw) => serde_json::from_str::<MeltAttempt>(raw.value())?,
-                        None => MeltAttempt {
-                            quote_id: None,
-                            unit: CurrencyUnit::Sat,
-                            submission_rejected: false,
-                        },
-                    };
-                    let value = serde_json::to_string(&attempt)?;
-                    attempts.insert(hash.value(), value.as_str())?;
-                }
-                metadata.insert("attempts_migrated", true)?;
-            }
+            write_txn.open_table(MINT_QUOTES_TABLE)?;
+            write_txn.open_table(MINT_PAYMENT_IDS_TABLE)?;
+            write_txn.open_table(MELT_QUOTES_TABLE)?;
+            write_txn.open_table(MELT_PAYMENT_IDS_TABLE)?;
+            write_txn.open_table(MELT_ATTEMPTS_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -96,29 +68,10 @@ impl QuoteDatabase {
         Ok(Self { db: Arc::new(db) })
     }
 
-    /// Store a created mint invoice.
-    pub fn insert_mint_quote(&self, payment_hash: &[u8; 32], payment_request: &str) -> Result<()> {
-        self.insert_mapping(MINT_QUOTES_TABLE, payment_hash, payment_request)
-    }
-
-    /// Get the mint invoice we created for this payment hash.
-    pub fn get_mint_quote(&self, payment_hash: &[u8; 32]) -> Result<Option<String>> {
-        self.get_mapping(MINT_QUOTES_TABLE, payment_hash)
-    }
-
-    /// Store the Lexe payment index for a created invoice.
-    pub fn insert_mint_payment_id(
-        &self,
-        payment_hash: &[u8; 32],
-        payment_index: &str,
-    ) -> Result<()> {
-        self.insert_mapping(MINT_PAYMENT_IDS_TABLE, payment_hash, payment_index)
-    }
-
     /// Store a created mint invoice and its Lexe payment index in a single
     /// transaction, so a crash between the two writes cannot leave an
     /// invoice without a payment index.
-    pub fn insert_mint_mappings(
+    pub fn insert_mint_quote_and_payment_id(
         &self,
         payment_hash: &[u8; 32],
         payment_request: &str,
@@ -132,11 +85,12 @@ impl QuoteDatabase {
             payment_ids.insert(payment_hash, payment_index)?;
         }
         write_txn.commit()?;
-        tracing::debug!(
-            "Inserted lexe mint mappings for payment hash {}",
-            hex::encode(payment_hash)
-        );
         Ok(())
+    }
+
+    /// Get the mint invoice we created for this payment hash.
+    pub fn get_mint_quote(&self, payment_hash: &[u8; 32]) -> Result<Option<String>> {
+        self.get_mapping(MINT_QUOTES_TABLE, payment_hash)
     }
 
     /// Get the Lexe payment index for a created invoice.
@@ -281,16 +235,14 @@ mod tests {
 
         {
             let db = QuoteDatabase::new(&path).expect("create quote database");
-            db.insert_mint_quote(&hash, "lnbc1incoming-invoice")
-                .expect("insert mint invoice");
-            db.insert_mint_payment_id(&hash, "0001-ln_aabbcc")
-                .expect("insert mint payment index");
+            db.insert_mint_quote_and_payment_id(&hash, "lnbc1incoming-invoice", "0001-ln_aabbcc")
+                .expect("insert mint quote and payment index");
             db.insert_melt_quote(&hash, "lnbc1outgoing-invoice")
                 .expect("insert melt invoice");
             db.insert_melt_payment_id(&hash, "0002-ln_ddddeeff")
                 .expect("insert melt payment index");
-            db.begin_melt_attempt(&hash, &quote_id, &CurrencyUnit::Msat)
-                .expect("insert melt quote id");
+            db.begin_melt_attempt(&hash, &quote_id, &CurrencyUnit::Sat)
+                .expect("begin melt attempt");
         }
 
         let db = QuoteDatabase::new(&path).expect("reopen quote database");
@@ -316,7 +268,7 @@ mod tests {
             db.get_melt_attempt(&hash).expect("get melt attempt"),
             Some(MeltAttempt {
                 quote_id: Some(quote_id),
-                unit: CurrencyUnit::Msat,
+                unit: CurrencyUnit::Sat,
                 submission_rejected: false,
             })
         );
@@ -372,31 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn attempts_without_rejection_field_remain_ambiguous_after_upgrade() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("quotes.db");
-        let owner = QuoteId::new();
-        {
-            let db = QuoteDatabase::new(&path).unwrap();
-            let raw = serde_json::json!({"quote_id": owner.to_string(), "unit": "sat"});
-            db.insert_mapping(MELT_ATTEMPTS_TABLE, &[1; 32], &raw.to_string())
-                .unwrap();
-        }
-        let db = QuoteDatabase::new(&path).unwrap();
-        assert_eq!(
-            db.get_melt_attempt(&[1; 32]).unwrap().unwrap(),
-            MeltAttempt {
-                quote_id: Some(owner),
-                unit: CurrencyUnit::Sat,
-                submission_rejected: false,
-            }
-        );
-        assert!(!db
-            .begin_melt_attempt(&[1; 32], &QuoteId::new(), &CurrencyUnit::Sat)
-            .unwrap());
-    }
-
-    #[test]
     fn rejection_requires_an_attempt_without_a_remote_index() {
         let dir = tempfile::tempdir().unwrap();
         let db = QuoteDatabase::new(dir.path().join("quotes.db")).unwrap();
@@ -417,57 +344,13 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_ambiguous_legacy_quotes_and_runs_only_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("quotes.db");
-        let owner = QuoteId::new();
-        {
-            let legacy = Database::create(&path).unwrap();
-            let txn = legacy.begin_write().unwrap();
-            {
-                let mut quotes = txn.open_table(MELT_QUOTES_TABLE).unwrap();
-                quotes
-                    .insert(&[1; 32], "legacy quoted or submitted invoice")
-                    .unwrap();
-                quotes
-                    .insert(&[2; 32], "legacy quote without owner")
-                    .unwrap();
-                let mut owners = txn.open_table(MELT_QUOTE_IDS_TABLE).unwrap();
-                let raw =
-                    serde_json::json!({"quote_id": owner.to_string(), "unit": "msat"}).to_string();
-                owners.insert(&[1; 32], raw.as_str()).unwrap();
-            }
-            txn.commit().unwrap();
-        }
-        {
-            let db = QuoteDatabase::new(&path).unwrap();
-            assert_eq!(
-                db.get_melt_attempt(&[1; 32]).unwrap().unwrap(),
-                MeltAttempt {
-                    quote_id: Some(owner),
-                    unit: CurrencyUnit::Msat,
-                    submission_rejected: false,
-                }
-            );
-            assert!(db.get_melt_attempt(&[2; 32]).unwrap().is_some());
-            assert!(!db
-                .begin_melt_attempt(&[1; 32], &QuoteId::new(), &CurrencyUnit::Sat)
-                .unwrap());
-            db.insert_melt_quote(&[3; 32], "new unattempted invoice")
-                .unwrap();
-        }
-        let db = QuoteDatabase::new(&path).unwrap();
-        assert!(db.get_melt_attempt(&[3; 32]).unwrap().is_none());
-    }
-
-    #[test]
-    fn mint_mappings_written_in_single_call() {
+    fn mint_quote_and_payment_id_written_in_single_call() {
         let path = test_db_path();
         let hash = [13_u8; 32];
 
         let db = QuoteDatabase::new(&path).expect("create quote database");
-        db.insert_mint_mappings(&hash, "lnbc1incoming-invoice", "0001-ln_aabbcc")
-            .expect("insert mint mappings");
+        db.insert_mint_quote_and_payment_id(&hash, "lnbc1incoming-invoice", "0001-ln_aabbcc")
+            .expect("insert mint quote and payment index");
 
         assert_eq!(
             db.get_mint_quote(&hash).expect("get mint invoice"),
