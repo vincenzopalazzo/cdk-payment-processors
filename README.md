@@ -26,13 +26,17 @@ BOLT11 features:
 | [Spark](crates/spark/README.md) | ❌ | ❌ | ❌ |
 | [Template](crates/template/README.md) | ❌ | ❌ | ✅ |
 
+Lexe's pinned SDK cannot enforce outgoing fee caps. Incoming BOLT11 payments
+are supported, but new capped melts are rejected; see its
+[payment limitations](crates/lexe/README.md#behavior-notes).
+
 ## Project structure
 
 ```text
 crates/
 ├── bark/        # Payment processor backed by a Bark wallet
-├── lexe/        # Payment processor backed by a Lexe managed node
 ├── ldk-server/  # Payment processor backed by an LDK Server node
+├── lexe/        # Payment processor backed by a Lexe managed node
 ├── lnbits/      # Payment processor backed by an LNbits wallet
 ├── spark/       # Payment processor backed by a Spark wallet
 └── template/    # Starting point for integrating a new payment backend

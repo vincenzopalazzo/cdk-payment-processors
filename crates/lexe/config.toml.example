@@ -31,9 +31,12 @@ network = "mainnet"
 data_dir = ".data/lexe"
 
 # Estimated outgoing fee for melt quotes (Lexe has no fee-estimate API):
-# fee = max(fee_reserve_ppm/1e6 * amount, fee_reserve_min_sat)
-fee_reserve_ppm = 100
-fee_reserve_min_sat = 1
+# fee = max(ceil(fee_reserve_ppm/1e6 * amount), fee_reserve_min_sat)
+# Same reserve defaults as LDK Server: 1% and 2 sats.
+# This is not a fee cap. The SDK cannot enforce max_fee_amount, so new
+# capped payment requests are rejected before submission (see README).
+fee_reserve_ppm = 10000
+fee_reserve_min_sat = 2
 
 # Default outgoing payment timeout in seconds when the mint does not
 # provide one (Lexe preflight can take ~60s; keep well above that).

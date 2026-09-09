@@ -23,35 +23,36 @@ use cdk_common::payment::{
     PaymentQuoteResponse, SettingsResponse, WaitPaymentResponse,
 };
 use cdk_common::util::unix_time;
-use cdk_common::{Amount, Bolt11Invoice, QuoteId};
+use cdk_common::{Amount, Bolt11Invoice};
 use futures::Stream;
 use lexe::config::WalletEnvConfig;
 use lexe::types::auth::{ClientCredentials, CredentialsRef, RootSeed};
 use lexe::types::bitcoin::{Amount as LexeAmount, Invoice as LexeInvoice};
 use lexe::types::command::{
-    CreateInvoiceRequest, GetPaymentRequest, PayInvoiceRequest, WaitForNextPaymentRequest,
+    CreateInvoiceRequest, GetPaymentRequest, GetUpdatedPaymentsRequest, PayInvoiceRequest,
 };
 use lexe::types::payment::{
-    Payment, PaymentCreatedIndex, PaymentDirection, PaymentFilter, PaymentStatus,
-    PaymentUpdatedIndex,
+    Payment, PaymentCreatedIndex, PaymentDirection, PaymentStatus, PaymentUpdatedIndex,
 };
 use lexe::util::ByteArray;
 use lexe::wallet::LexeWallet;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::client::LexeClient;
 use crate::database::QuoteDatabase;
 use crate::settings::Config;
 
-/// How long the payment-update poller waits for the next Lexe update.
+/// Bound each SDK update fetch, including its network sync.
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const EVENT_PAGE_SIZE: usize = 100;
 /// Initial backoff after a failed poll.
 const POLL_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 /// Maximum backoff after a failed poll.
 const POLL_BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// How many recent Lexe payments to scan when recovering an in-flight
-/// outgoing payment whose index was not stored yet.
-const RECOVERY_SCAN_LIMIT: usize = 500;
+/// Number of records per page; recovery continues through all pages.
+const RECOVERY_PAGE_SIZE: usize = 500;
 
 /// Event stream that releases its Lexe poller activity on completion or drop.
 struct PaymentEventStream {
@@ -111,7 +112,7 @@ impl Drop for PaymentEventStream {
 
 /// CDK payment backend backed by a Lexe managed Lightning node.
 pub struct LexeBackend {
-    wallet: Arc<LexeWallet>,
+    wallet: Arc<dyn LexeClient>,
     db: QuoteDatabase,
     active_payment_streams: Arc<AtomicUsize>,
     event_cancel: watch::Sender<()>,
@@ -215,21 +216,33 @@ impl LexeBackend {
         })
     }
 
-    /// Best-effort lookup of a payment by BOLT11 payment hash in the recent
-    /// Lexe payment history.
+    /// Recover an outbound payment across the complete local history.
     async fn find_payment_by_hash(&self, hash: &[u8; 32]) -> Result<Option<Payment>, Error> {
         self.wallet
             .sync_payments()
             .await
             .map_err(|e| Error::Backend(anyhow!("Lexe payment sync failed: {e}").into()))?;
-        let response = self
-            .wallet
-            .list_payments(&PaymentFilter::All, None, Some(RECOVERY_SCAN_LIMIT), None)
-            .map_err(|e| Error::Backend(anyhow!("Lexe payment list failed: {e}").into()))?;
-        Ok(response
-            .payments
-            .into_iter()
-            .find(|p| p.hash.as_ref().map(|h| h.to_array()) == Some(*hash)))
+        let mut after = None;
+        loop {
+            let response = self
+                .wallet
+                .list_payments(RECOVERY_PAGE_SIZE, after.as_ref())
+                .map_err(|e| Error::Backend(anyhow!("Lexe payment list failed: {e}").into()))?;
+            if let Some(payment) = response.payments.into_iter().find(|p| {
+                p.direction == PaymentDirection::Outbound
+                    && p.hash.as_ref().map(|h| h.to_array()) == Some(*hash)
+            }) {
+                return Ok(Some(payment));
+            }
+            let Some(next) = response.next_index else {
+                return Ok(None);
+            };
+            if after.as_ref() == Some(&next) {
+                return Err(Error::Custom("Lexe recovery cursor did not advance".into()));
+            }
+            after = Some(next);
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Fetch a payment by stored Lexe index string.
@@ -254,6 +267,13 @@ impl LexeBackend {
         }
     }
 
+    fn ensure_supported_unit(unit: &CurrencyUnit) -> Result<(), Error> {
+        if unit != &CurrencyUnit::Sat {
+            return Err(Error::UnsupportedUnit);
+        }
+        Ok(())
+    }
+
     fn invoice_amount_sats(invoice: &Bolt11Invoice) -> Result<u64, Error> {
         let amount_msat = invoice
             .amount_milli_satoshis()
@@ -267,11 +287,8 @@ impl LexeBackend {
 
     /// Estimated outgoing fee: `ppm` of the amount, at least `min_sat`.
     fn estimate_fee_sats(amount_sats: u64, ppm: u32, min_sat: u64) -> u64 {
-        let estimated = amount_sats
-            .saturating_mul(u64::from(ppm))
-            .saturating_add(999_999)
-            / 1_000_000;
-        estimated.max(min_sat)
+        let estimated = (u128::from(amount_sats) * u128::from(ppm)).div_ceil(1_000_000);
+        u64::try_from(estimated).unwrap_or(u64::MAX).max(min_sat)
     }
 
     fn melt_status(status: PaymentStatus) -> MeltQuoteState {
@@ -286,43 +303,50 @@ impl LexeBackend {
         payment_identifier: PaymentIdentifier,
         unit: &CurrencyUnit,
         payment: &Payment,
-    ) -> MakePaymentResponse {
+    ) -> Result<MakePaymentResponse, Error> {
         let status = Self::melt_status(payment.status);
         let total_spent = if status == MeltQuoteState::Paid {
-            let sats = payment
+            let amount = payment
                 .amount
-                .map(|a| a.sats_u64())
-                .unwrap_or_default()
-                .saturating_add(payment.fees.sats_u64());
-            Amount::new(sats, CurrencyUnit::Sat)
-                .convert_to(unit)
-                .unwrap_or_else(|_| Amount::new(0, unit.clone()))
+                .ok_or_else(|| Error::Custom("Completed Lexe payment has no amount".into()))?;
+            let msats = amount
+                .msat()
+                .checked_add(payment.fees.msat())
+                .ok_or_else(|| Error::Custom("Lexe payment total overflow".into()))?;
+            match unit {
+                CurrencyUnit::Sat => Amount::new(msats.div_ceil(1000), CurrencyUnit::Sat),
+                // Preserve the precision of attempts migrated from older versions.
+                CurrencyUnit::Msat => Amount::new(msats, CurrencyUnit::Msat),
+                _ => return Err(Error::UnsupportedUnit),
+            }
         } else {
             Amount::new(0, unit.clone())
         };
-        MakePaymentResponse {
+        Ok(MakePaymentResponse {
             payment_lookup_id: payment_identifier,
             payment_proof: payment
                 .preimage
                 .map(|preimage| hex::encode(preimage.to_array())),
             status,
             total_spent,
-        }
+        })
     }
 
-    /// Unit used by the melt quote for this payment hash (for event details).
-    fn stored_melt_unit(&self, hash: &[u8; 32]) -> CurrencyUnit {
-        self.db
-            .get_melt_quote_id(hash)
-            .ok()
-            .flatten()
-            .and_then(|raw| {
-                serde_json::from_str::<serde_json::Value>(&raw)
-                    .ok()
-                    .and_then(|v| v.get("unit")?.as_str().map(str::to_string))
-            })
-            .and_then(|u| CurrencyUnit::from_str(&u).ok())
-            .unwrap_or(CurrencyUnit::Sat)
+    fn unpaid_or_pending(
+        identifier: PaymentIdentifier,
+        unit: CurrencyUnit,
+        attempted: bool,
+    ) -> MakePaymentResponse {
+        MakePaymentResponse {
+            payment_lookup_id: identifier,
+            payment_proof: None,
+            status: if attempted {
+                MeltQuoteState::Pending
+            } else {
+                MeltQuoteState::Unpaid
+            },
+            total_spent: Amount::new(0, unit),
+        }
     }
 }
 
@@ -366,6 +390,7 @@ impl MintPayment for LexeBackend {
             return Err(Error::UnsupportedPaymentOption);
         };
 
+        Self::ensure_supported_unit(opts.amount.unit())?;
         let amount_sats = opts.amount.to_sat()?;
         if amount_sats == 0 {
             return Err(Error::AmountMismatch);
@@ -423,6 +448,7 @@ impl MintPayment for LexeBackend {
         unit: &CurrencyUnit,
         options: OutgoingPaymentOptions,
     ) -> Result<PaymentQuoteResponse, Self::Err> {
+        Self::ensure_supported_unit(unit)?;
         let OutgoingPaymentOptions::Bolt11(opts) = options else {
             return Err(Error::UnsupportedPaymentOption);
         };
@@ -436,14 +462,11 @@ impl MintPayment for LexeBackend {
         self.db
             .insert_melt_quote(&payment_hash, &invoice)
             .map_err(|e| Error::Custom(e.to_string()))?;
-        self.db
-            .insert_melt_quote_id(&payment_hash, &opts.quote_id.to_string(), &unit.to_string())
-            .map_err(|e| Error::Custom(e.to_string()))?;
 
         Ok(PaymentQuoteResponse {
             request_lookup_id: Some(PaymentIdentifier::PaymentHash(payment_hash)),
-            amount: Amount::from(amount_sats).with_unit(unit.clone()),
-            fee: Amount::from(fee_sats).with_unit(unit.clone()),
+            amount: Amount::new(amount_sats, CurrencyUnit::Sat),
+            fee: Amount::new(fee_sats, CurrencyUnit::Sat),
             state: MeltQuoteState::Unpaid,
             extra_json: None,
             estimated_blocks: None,
@@ -456,59 +479,65 @@ impl MintPayment for LexeBackend {
         unit: &CurrencyUnit,
         options: OutgoingPaymentOptions,
     ) -> Result<MakePaymentResponse, Self::Err> {
+        Self::ensure_supported_unit(unit)?;
         let OutgoingPaymentOptions::Bolt11(opts) = options else {
             return Err(Error::UnsupportedPaymentOption);
         };
 
         let invoice = opts.bolt11.to_string();
-        let amount_sats = Self::invoice_amount_sats(&opts.bolt11)?;
+        Self::invoice_amount_sats(&opts.bolt11)?;
         let payment_hash = opts.bolt11.payment_hash().to_byte_array();
         let identifier = PaymentIdentifier::PaymentHash(payment_hash);
 
         self.db
             .insert_melt_quote(&payment_hash, &invoice)
             .map_err(|e| Error::Custom(e.to_string()))?;
-        self.db
-            .insert_melt_quote_id(&payment_hash, &opts.quote_id.to_string(), &unit.to_string())
-            .map_err(|e| Error::Custom(e.to_string()))?;
-
-        // Idempotency: if we already have a Lexe payment for this invoice,
-        // report its current state instead of paying again.
-        if let Some(index) = self
+        // An existing attempt must be reconciled even if this retry carries
+        // different options. Neither its event owner nor its unit can change.
+        if self
             .db
-            .get_melt_payment_id(&payment_hash)
+            .get_melt_attempt(&payment_hash)
             .map_err(|e| Error::Custom(e.to_string()))?
+            .is_some()
         {
-            if let Some(payment) = self.fetch_payment(&index).await? {
-                return Ok(Self::outgoing_response(identifier, unit, &payment));
-            }
+            return self.check_outgoing_payment(&identifier).await;
         }
 
+        // The stable SDK cannot constrain routing fees. Never turn a capped
+        // request into an uncapped spend. Local rejection creates no attempt.
+        if opts.max_fee_amount.is_some() {
+            return Err(Error::Custom(
+                "Lexe SDK cannot enforce max_fee_amount; capped outgoing payments are unsupported"
+                    .into(),
+            ));
+        }
+        if opts.melt_options.is_some() {
+            return Err(Error::UnsupportedPaymentOption);
+        }
         let lexe_invoice = LexeInvoice::from_str(&invoice).map_err(|e| {
             Error::Custom(format!("failed to parse outgoing invoice for Lexe: {e}"))
         })?;
-        // Lexe rejects a fallback amount that differs from the invoice amount,
-        // and only needs one for amountless invoices. Invoices without an
-        // amount are already rejected above (invoice_amount_sats), so this is
-        // only a defensive value for the amountless case.
-        let fallback_amount = if opts.bolt11.amount_milli_satoshis().is_some() {
-            None
-        } else {
-            Some(
-                LexeAmount::try_from_sats_u64(amount_sats)
-                    .map_err(|e| Error::Custom(format!("invalid invoice amount: {e}")))?,
-            )
-        };
         let timeout = opts
             .timeout_secs
             .map(Duration::from_secs)
             .unwrap_or(self.payment_timeout);
 
+        // All local validation precedes this durable intent. If the process
+        // stops anywhere after it, recovery remains conservative. The atomic
+        // claim also serializes concurrent submissions of the same invoice.
+        if !self
+            .db
+            .begin_melt_attempt(&payment_hash, &opts.quote_id, unit)
+            .map_err(|e| Error::Custom(e.to_string()))?
+        {
+            return self.check_outgoing_payment(&identifier).await;
+        }
+
         match tokio::time::timeout(
             timeout,
             self.wallet.pay_invoice(PayInvoiceRequest {
                 invoice: lexe_invoice,
-                fallback_amount,
+                fallback_amount: None,
                 personal_note: None,
             }),
         )
@@ -518,31 +547,21 @@ impl MintPayment for LexeBackend {
                 self.db
                     .insert_melt_payment_id(&payment_hash, &payment.index.to_string())
                     .map_err(|e| Error::Custom(e.to_string()))?;
-                Ok(Self::outgoing_response(identifier, unit, &payment))
+                Self::outgoing_response(identifier, unit, &payment)
             }
-            Ok(Err(e)) => Err(Error::Backend(
-                anyhow!("Lexe pay_invoice failed: {e}").into(),
-            )),
+            Ok(Err(e)) => {
+                // SDK errors can originate while polling an already accepted
+                // payment. They do not prove that submission failed.
+                tracing::warn!(error = %e, "Lexe payment result is ambiguous; reconciling");
+                self.check_outgoing_payment(&identifier).await
+            }
             Err(_) => {
                 tracing::warn!(
                     payment_hash = %hex::encode(payment_hash),
                     ?timeout,
                     "Lexe pay_invoice timed out; payment may still be in flight"
                 );
-                match self.find_payment_by_hash(&payment_hash).await? {
-                    Some(payment) => {
-                        self.db
-                            .insert_melt_payment_id(&payment_hash, &payment.index.to_string())
-                            .map_err(|e| Error::Custom(e.to_string()))?;
-                        Ok(Self::outgoing_response(identifier, unit, &payment))
-                    }
-                    None => Ok(MakePaymentResponse {
-                        payment_lookup_id: identifier,
-                        payment_proof: None,
-                        status: MeltQuoteState::Pending,
-                        total_spent: Amount::new(0, unit.clone()),
-                    }),
-                }
+                self.check_outgoing_payment(&identifier).await
             }
         }
     }
@@ -559,39 +578,64 @@ impl MintPayment for LexeBackend {
 
         tokio::spawn(async move {
             let mut backoff = POLL_BACKOFF_INITIAL;
-            // SDK-documented cursor: each poll starts after the previous
-            // update, so an event is never delivered twice.
+            // GetUpdatedPayments(None) replays cached history, unlike
+            // WaitForNextPayment(None), which starts at the SDK cache tip.
+            // Reconnects deliberately replay: gRPC has no consumer ack, so
+            // persisting an enqueue cursor could lose undelivered events.
             let mut cursor: Option<PaymentUpdatedIndex> = None;
-            loop {
-                tokio::select! {
+            'poll: loop {
+                let result = tokio::select! {
                     _ = cancel.changed() => break,
                     _ = sender.closed() => break,
-                    result = wallet.wait_for_next_payment(WaitForNextPaymentRequest {
+                    result = tokio::time::timeout(POLL_TIMEOUT, wallet.get_updated_payments(GetUpdatedPaymentsRequest {
                         start_index: cursor,
-                        timeout: Some(POLL_TIMEOUT),
-                    }) => {
-                        match result {
-                            Ok(response) => {
-                                cursor = Some(response.next_start_index);
-                                backoff = POLL_BACKOFF_INITIAL;
-                                if let Some(event) =
-                                    map_payment_event(&db, &response.payment)
-                                {
-                                    if sender.send(event).await.is_err() {
-                                        break;
+                        limit: Some(EVENT_PAGE_SIZE),
+                    })) => result.map_err(anyhow::Error::from).and_then(|result| result),
+                };
+                let delay = match result {
+                    Ok(response) => {
+                        let empty = response.payments.is_empty();
+                        let mut failed = false;
+                        for payment in response.payments {
+                            match map_payment_event(&db, &payment) {
+                                Ok(Some(event)) => {
+                                    tokio::select! {
+                                        _ = cancel.changed() => break 'poll,
+                                        result = sender.send(event) => if result.is_err() { break 'poll; },
                                     }
                                 }
-                            }
-                            Err(err) => {
-                                tracing::debug!("Lexe payment update wait: {err}");
-                                tokio::select! {
-                                    _ = tokio::time::sleep(backoff) => {}
-                                    _ = cancel.changed() => break,
+                                Ok(None) => {}
+                                Err(err) => {
+                                    tracing::warn!("Could not map Lexe payment update: {err}");
+                                    failed = true;
+                                    break;
                                 }
-                                backoff = (backoff * 2).min(POLL_BACKOFF_MAX);
+                            }
+                            // Never skip a failed mapping or blocked delivery.
+                            cursor = Some(payment.updated_index());
+                        }
+                        if failed {
+                            backoff
+                        } else {
+                            backoff = POLL_BACKOFF_INITIAL;
+                            if empty {
+                                POLL_INTERVAL
+                            } else {
+                                Duration::ZERO
                             }
                         }
                     }
+                    Err(err) => {
+                        tracing::warn!("Could not fetch Lexe payment updates: {err}");
+                        let delay = backoff;
+                        backoff = (backoff * 2).min(POLL_BACKOFF_MAX);
+                        delay
+                    }
+                };
+                tokio::select! {
+                    _ = cancel.changed() => break,
+                    _ = sender.closed() => break,
+                    _ = tokio::time::sleep(delay) => {}
                 }
             }
             activity.deactivate();
@@ -651,59 +695,54 @@ impl MintPayment for LexeBackend {
     ) -> Result<MakePaymentResponse, Self::Err> {
         let payment_hash = *Self::payment_hash_of(payment_identifier)?;
 
+        let attempt = self
+            .db
+            .get_melt_attempt(&payment_hash)
+            .map_err(|e| Error::Custom(e.to_string()))?;
+        let Some(attempt) = attempt else {
+            if self
+                .db
+                .get_melt_quote(&payment_hash)
+                .map_err(|e| Error::Custom(e.to_string()))?
+                .is_none()
+            {
+                return Err(Error::Custom("Outgoing payment not found".into()));
+            }
+            return Ok(Self::unpaid_or_pending(
+                payment_identifier.clone(),
+                CurrencyUnit::Sat,
+                false,
+            ));
+        };
+
         if let Some(index) = self
             .db
             .get_melt_payment_id(&payment_hash)
             .map_err(|e| Error::Custom(e.to_string()))?
         {
             if let Some(payment) = self.fetch_payment(&index).await? {
-                let unit = self.stored_melt_unit(&payment_hash);
-                return Ok(Self::outgoing_response(
+                return Self::outgoing_response(
                     payment_identifier.clone(),
-                    &unit,
+                    &attempt.unit,
                     &payment,
-                ));
+                );
             }
-            // Index stored but no payment record yet: still in flight.
-            return Ok(MakePaymentResponse {
-                payment_lookup_id: payment_identifier.clone(),
-                payment_proof: None,
-                status: MeltQuoteState::Pending,
-                total_spent: Amount::new(0, CurrencyUnit::Sat),
-            });
         }
 
-        // No stored index: was this invoice ever quoted?
-        if self
-            .db
-            .get_melt_quote(&payment_hash)
-            .map_err(|e| Error::Custom(e.to_string()))?
-            .is_none()
-        {
-            return Err(Error::Custom("Outgoing payment not found".to_string()));
-        }
-
-        // Quoted but no Lexe payment index stored yet (e.g. make_payment
-        // timed out before the index was recorded). Scan recent payments.
+        // The remote index may have been lost with the submission response.
         if let Some(payment) = self.find_payment_by_hash(&payment_hash).await? {
             self.db
                 .insert_melt_payment_id(&payment_hash, &payment.index.to_string())
                 .map_err(|e| Error::Custom(e.to_string()))?;
-            let unit = self.stored_melt_unit(&payment_hash);
-            return Ok(Self::outgoing_response(
-                payment_identifier.clone(),
-                &unit,
-                &payment,
-            ));
+            return Self::outgoing_response(payment_identifier.clone(), &attempt.unit, &payment);
         }
 
         // Conservatively Pending: the invoice may still settle remotely.
-        Ok(MakePaymentResponse {
-            payment_lookup_id: payment_identifier.clone(),
-            payment_proof: None,
-            status: MeltQuoteState::Pending,
-            total_spent: Amount::new(0, CurrencyUnit::Sat),
-        })
+        Ok(Self::unpaid_or_pending(
+            payment_identifier.clone(),
+            attempt.unit,
+            true,
+        ))
     }
 }
 
@@ -731,60 +770,60 @@ fn wallet_env_config(network: &str) -> std::result::Result<WalletEnvConfig, anyh
 }
 
 /// Map a Lexe payment update to a CDK event, if it is one of our payments.
-fn map_payment_event(db: &QuoteDatabase, payment: &Payment) -> Option<Event> {
-    let hash = payment.hash.as_ref()?.to_array();
+fn map_payment_event(db: &QuoteDatabase, payment: &Payment) -> Result<Option<Event>, Error> {
+    let Some(hash) = payment.hash.as_ref().map(|hash| hash.to_array()) else {
+        return Ok(None);
+    };
 
     match payment.direction {
         PaymentDirection::Inbound => {
             if payment.status != PaymentStatus::Completed {
-                return None;
+                return Ok(None);
             }
             // Only emit for invoices we created.
-            db.get_mint_quote(&hash).ok().flatten()?;
+            if db
+                .get_mint_quote(&hash)
+                .map_err(|e| Error::Custom(e.to_string()))?
+                .is_none()
+            {
+                return Ok(None);
+            }
             let amount_sats = payment.amount.map(|a| a.sats_u64()).unwrap_or_default();
-            Some(Event::PaymentReceived(WaitPaymentResponse {
+            Ok(Some(Event::PaymentReceived(WaitPaymentResponse {
                 payment_id: payment.index.to_string(),
                 payment_identifier: PaymentIdentifier::PaymentHash(hash),
                 payment_amount: Amount::new(amount_sats, CurrencyUnit::Sat),
-            }))
+            })))
         }
         PaymentDirection::Outbound => {
-            let raw = db.get_melt_quote_id(&hash).ok()??;
-            let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
-            let quote_id: QuoteId = value.get("quote_id")?.as_str()?.parse().ok()?;
+            let Some(attempt) = db
+                .get_melt_attempt(&hash)
+                .map_err(|e| Error::Custom(e.to_string()))?
+            else {
+                return Ok(None);
+            };
+            db.insert_melt_payment_id(&hash, &payment.index.to_string())
+                .map_err(|e| Error::Custom(e.to_string()))?;
+            let Some(quote_id) = attempt.quote_id else {
+                return Ok(None);
+            };
             match payment.status {
                 PaymentStatus::Completed => {
-                    let unit = value
-                        .get("unit")
-                        .and_then(|u| u.as_str())
-                        .and_then(|u| CurrencyUnit::from_str(u).ok())
-                        .unwrap_or(CurrencyUnit::Sat);
-                    let sats = payment
-                        .amount
-                        .map(|a| a.sats_u64())
-                        .unwrap_or_default()
-                        .saturating_add(payment.fees.sats_u64());
-                    let total_spent = Amount::new(sats, CurrencyUnit::Sat)
-                        .convert_to(&unit)
-                        .unwrap_or_else(|_| Amount::new(0, unit.clone()));
-                    let details = MakePaymentResponse {
-                        payment_lookup_id: PaymentIdentifier::PaymentHash(hash),
-                        payment_proof: payment
-                            .preimage
-                            .map(|preimage| hex::encode(preimage.to_array())),
-                        status: MeltQuoteState::Paid,
-                        total_spent,
-                    };
-                    Some(Event::PaymentSuccessful { quote_id, details })
+                    let details = LexeBackend::outgoing_response(
+                        PaymentIdentifier::PaymentHash(hash),
+                        &attempt.unit,
+                        payment,
+                    )?;
+                    Ok(Some(Event::PaymentSuccessful { quote_id, details }))
                 }
-                PaymentStatus::Failed => Some(Event::PaymentFailed {
+                PaymentStatus::Failed => Ok(Some(Event::PaymentFailed {
                     quote_id,
                     reason: payment.status_msg.clone(),
-                }),
-                PaymentStatus::Pending => None,
+                })),
+                PaymentStatus::Pending => Ok(None),
             }
         }
-        PaymentDirection::Info => None,
+        PaymentDirection::Info => Ok(None),
     }
 }
 
@@ -792,6 +831,7 @@ fn map_payment_event(db: &QuoteDatabase, payment: &Payment) -> Option<Event> {
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use cdk_common::QuoteId;
     use lexe::types::payment::{PaymentKind, PaymentRail};
     use lexe::types::util::TimestampMs;
 
@@ -865,7 +905,7 @@ mod tests {
         ))
     }
 
-    fn test_payment(
+    pub(super) fn test_payment(
         direction: PaymentDirection,
         status: PaymentStatus,
         hash: [u8; 32],
@@ -927,7 +967,10 @@ mod tests {
             0,
             "received",
         );
-        match map_payment_event(&db, &payment).expect("event for our completed inbound payment") {
+        match map_payment_event(&db, &payment)
+            .unwrap()
+            .expect("event for our completed inbound payment")
+        {
             Event::PaymentReceived(response) => {
                 assert_eq!(
                     response.payment_identifier,
@@ -961,7 +1004,7 @@ mod tests {
             0,
             "received",
         );
-        assert!(map_payment_event(&db, &foreign_payment).is_none());
+        assert!(map_payment_event(&db, &foreign_payment).unwrap().is_none());
 
         // Our invoice, but not settled yet.
         let pending = test_payment(
@@ -972,7 +1015,7 @@ mod tests {
             0,
             "pending",
         );
-        assert!(map_payment_event(&db, &pending).is_none());
+        assert!(map_payment_event(&db, &pending).unwrap().is_none());
         std::fs::remove_file(&path).ok();
     }
 
@@ -984,7 +1027,7 @@ mod tests {
         let quote_id: QuoteId = "018f8b3e-8c1a-7d2e-9f4b-6a1c3e5d7f90"
             .parse()
             .expect("valid quote id");
-        db.insert_melt_quote_id(&hash, &quote_id.to_string(), "msat")
+        db.begin_melt_attempt(&hash, &quote_id, &CurrencyUnit::Msat)
             .expect("insert melt quote id");
 
         let payment = test_payment(
@@ -995,7 +1038,10 @@ mod tests {
             3,
             "settled",
         );
-        match map_payment_event(&db, &payment).expect("event for our settled outbound payment") {
+        match map_payment_event(&db, &payment)
+            .unwrap()
+            .expect("event for our settled outbound payment")
+        {
             Event::PaymentSuccessful {
                 quote_id: event_quote_id,
                 details,
@@ -1022,7 +1068,7 @@ mod tests {
         let quote_id: QuoteId = "018f8b3e-8c1a-7d2e-9f4b-6a1c3e5d7f91"
             .parse()
             .expect("valid quote id");
-        db.insert_melt_quote_id(&hash, &quote_id.to_string(), "sat")
+        db.begin_melt_attempt(&hash, &quote_id, &CurrencyUnit::Sat)
             .expect("insert melt quote id");
 
         let payment = test_payment(
@@ -1033,7 +1079,10 @@ mod tests {
             0,
             "timed out",
         );
-        match map_payment_event(&db, &payment).expect("event for our failed outbound payment") {
+        match map_payment_event(&db, &payment)
+            .unwrap()
+            .expect("event for our failed outbound payment")
+        {
             Event::PaymentFailed {
                 quote_id: event_quote_id,
                 reason,
@@ -1054,7 +1103,7 @@ mod tests {
         let quote_id: QuoteId = "018f8b3e-8c1a-7d2e-9f4b-6a1c3e5d7f92"
             .parse()
             .expect("valid quote id");
-        db.insert_melt_quote_id(&hash, &quote_id.to_string(), "sat")
+        db.begin_melt_attempt(&hash, &quote_id, &CurrencyUnit::Sat)
             .expect("insert melt quote id");
 
         let payment = test_payment(
@@ -1065,7 +1114,11 @@ mod tests {
             0,
             "in flight",
         );
-        assert!(map_payment_event(&db, &payment).is_none());
+        assert!(map_payment_event(&db, &payment).unwrap().is_none());
         std::fs::remove_file(&path).ok();
     }
 }
+
+#[cfg(test)]
+#[path = "backend_tests.rs"]
+mod regression_tests;

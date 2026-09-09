@@ -612,6 +612,7 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

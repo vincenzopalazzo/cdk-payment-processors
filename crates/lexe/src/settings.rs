@@ -61,11 +61,11 @@ fn default_data_dir() -> String {
 }
 
 fn default_fee_reserve_ppm() -> u32 {
-    100
+    10_000
 }
 
 fn default_fee_reserve_min_sat() -> u32 {
-    1
+    2
 }
 
 fn default_payment_timeout_secs() -> u64 {
@@ -278,8 +278,8 @@ mod tests {
         assert_eq!(cfg.lexe.client_credentials.as_deref(), Some("dGVzdA=="));
         assert_eq!(cfg.lexe.network, "mainnet");
         assert_eq!(cfg.lexe.data_dir, ".data/lexe");
-        assert_eq!(cfg.lexe.fee_reserve_ppm, 100);
-        assert_eq!(cfg.lexe.fee_reserve_min_sat, 1);
+        assert_eq!(cfg.lexe.fee_reserve_ppm, 10_000);
+        assert_eq!(cfg.lexe.fee_reserve_min_sat, 2);
         assert_eq!(cfg.lexe.payment_timeout_secs, 300);
         clear_test_env();
     }

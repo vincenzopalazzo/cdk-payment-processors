@@ -4,6 +4,12 @@ A CDK payment processor backed by a [Lexe](https://github.com/lexe-app/lexe-publ
 managed non-custodial Lightning node (SGX). Exposes the node to `cdk-mintd`
 over the CDK payment processor gRPC protocol, with BOLT11 support.
 
+The processor advertises `sat` and accepts new requests only in that unit.
+The pinned SDK cannot enforce routing fee limits: new outgoing payments with
+`max_fee_amount` are rejected before submission. This includes ordinary CDK
+melts that supply a fee cap; they require SDK support for an enforceable limit
+before they can be served by this processor. Incoming payments are supported.
+
 Authentication follows the same model as
 [lexe-mcp](https://github.com/vincenzopalazzo/lexe-mcp): a single base64
 "SDK client credentials" blob created in the Lexe app (Menu → SDK clients).
@@ -27,10 +33,10 @@ Point `cdk-mintd` at the processor:
 ```toml
 [payment_backend]
 backend = "grpcprocessor"
-unit = "msat"
+unit = "sat"
 
 [grpc_processor]
-supported_units = ["msat"]
+supported_units = ["sat"]
 address = "127.0.0.1"
 port = 50051
 allow_insecure = true
@@ -60,8 +66,8 @@ values.
 | `lexe.seed_phrase` | `LEXE_SEED_PHRASE` | Required (xor) |
 | `lexe.network` | `LEXE_NETWORK` | `mainnet` |
 | `lexe.data_dir` | `LEXE_DATA_DIR` | `.data/lexe` |
-| `lexe.fee_reserve_ppm` | `LEXE_FEE_RESERVE_PPM` | `100` |
-| `lexe.fee_reserve_min_sat` | `LEXE_FEE_RESERVE_MIN_SAT` | `1` |
+| `lexe.fee_reserve_ppm` | `LEXE_FEE_RESERVE_PPM` | `10000` |
+| `lexe.fee_reserve_min_sat` | `LEXE_FEE_RESERVE_MIN_SAT` | `2` |
 | `lexe.payment_timeout_secs` | `LEXE_PAYMENT_TIMEOUT_SECS` | `300` |
 
 Exactly one of `client_credentials` / `seed_phrase` must be configured. The
@@ -83,27 +89,64 @@ trusted.
 
 ## Behavior notes
 
-- **Incoming (mint):** the processor creates BOLT11 invoices on the Lexe
-  node, keyed by payment hash in a local redb database, and reports
-  `PaymentReceived` events via an index-cursor polling stream
-  (`wait_for_next_payment` with backoff).
-- **Outgoing (melt):** Lexe has no fee-estimate API and no client idempotency
-  token, so quotes use a configurable fee estimate
-  (`max(ppm * amount, min_sat)`, real fee is reported once the payment
-  settles), and retry safety comes from the local database: a stored Lexe
-  payment index is re-queried instead of paying again. `pay_invoice` blocks
-  to a terminal state; on timeout the payment is reported `Pending` and
-  recovered by scanning recent payments by payment hash.
-- **Status checks:** `check_incoming_payment_status` / `check_outgoing_payment`
-  resolve stored Lexe payment indexes and map `completed`/`failed`/`pending`
-  to the CDK quote states.
+- **Incoming (mint):** invoices and payment indexes are stored by payment
+  hash in the local redb database. Completed incoming payments generate
+  `PaymentReceived` events.
+- **Quotes and fees:** fee estimates use
+  `max(ceil(amount_sat * ppm / 1_000_000), min_sat)`. Defaults are 1%
+  (10,000 ppm) and 2 sats, matching LDK Server's reserve defaults. These are
+  estimates, not enforceable limits. Only requests with no `max_fee_amount`
+  can initiate an outgoing payment; such requests explicitly have no fee cap.
+  Principal and actual fees are summed in millisatoshis, then rounded up
+  once to report a satoshi total.
+- **Submission and retry safety:** a durable attempt record claims the
+  payment hash and its original quote ID atomically before submission.
+  Requesting another quote cannot replace the executing quote's event owner.
+  Repeated or concurrent payment calls recover the existing attempt; they
+  do not submit it again. A prepared quote with no attempt returns `Unpaid`,
+  including after local rejection of a fee cap.
+- **Status and recovery:** stored indexes are queried first. A missing index
+  is recovered by paginating the full history for an outbound payment with
+  the same hash. Remote `completed`/`failed`/`pending` states become
+  `Paid`/`Failed`/`Pending`. Timeouts and SDK errors can occur after remote
+  acceptance, so an unresolved attempt remains `Pending` (or returns a
+  lookup error if the node cannot be reached). A crash between recording
+  intent and submission is also ambiguous and requires reconciliation;
+  absence from history alone does not permit another submission.
+- **Events and reconnects:** `get_updated_payments` reads cached and new
+  updates in batches, polling every 5 seconds when caught up and backing off
+  on errors. Each subscription replays history from the beginning, then
+  advances its own cursor. This also reconciles after restart, and prevents
+  SDK cache syncs from skipping events. Replays may duplicate terminal events;
+  the mint must handle them idempotently by payment/quote ID. gRPC provides no
+  event acknowledgment, so enqueueing an event is not treated as durable
+  confirmation that the mint received it. Reconnect work scales with history.
+
+Keep `lexe.data_dir` persistent. On first opening a database from the original
+implementation, existing melt quotes are conservatively migrated as attempts:
+the old schema cannot prove which were submitted. Their stored quote IDs,
+units, and payment indexes are preserved. Legacy msat totals remain exact
+during recovery. An unresolved legacy quote may stay `Pending` even if it was
+never submitted; do not delete attempt records to force a retry without first
+establishing the remote payment's final outcome.
 
 ## Startup self-check
 
-After binding, the processor calls its own `GetSettings` from the local host
+With TLS disabled, after binding the processor calls its own `GetSettings`
+from the local host
 (using loopback for unspecified addresses such as `0.0.0.0`) and **exits
 non-zero** if it does not answer. This fails fast on port conflicts instead of
 looking healthy while another service owns the port.
+The plaintext self-check is skipped when TLS is enabled; server errors are
+still propagated.
+
+## Development
+
+Run `just ci` for formatting, Clippy, and tests. Tests mock the Lexe SDK
+boundary and cover accounting, fee-cap rejection, concurrent submission,
+timeout/restart recovery, pagination, database migration, and event replay.
+They do not provision a node or make payments. End-to-end validation requires
+a real Lexe node and is not part of the test suite.
 
 ## Notes
 

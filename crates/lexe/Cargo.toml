@@ -25,3 +25,5 @@ tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[dev-dependencies]
+tempfile = "3"
