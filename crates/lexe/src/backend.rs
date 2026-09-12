@@ -775,13 +775,12 @@ impl MintPayment for LexeBackend {
 
 /// Decode a base64 Lexe SDK client-credentials blob.
 fn decode_client_credentials(raw: &str) -> anyhow::Result<ClientCredentials> {
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(raw.trim())
-        .context("client credentials are not valid base64")?;
-    let credentials: ClientCredentials = serde_json::from_slice(&bytes)
-        .context("client credentials are not a valid SDK credentials blob")?;
-    Ok(credentials)
+    // Use the SDK's own blob format (base64 STANDARD_NO_PAD of the typed
+    // JSON credentials, with a client key/public-key consistency check).
+    // Deserializing the wrapper type from the raw JSON fails because its
+    // Deserialize impl expects the blob string, not the JSON object.
+    ClientCredentials::from_str(raw.trim())
+        .context("client credentials are not a valid SDK credentials blob")
 }
 
 /// Wallet environment for the configured network.

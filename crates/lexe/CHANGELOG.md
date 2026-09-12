@@ -62,6 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report the server's real bind error when the plaintext self-check races
   a dying server task, and redact credentials in debug output (tests load
   env-only config so they do not depend on a local `config.toml`).
+- Parse SDK client-credentials blobs with the SDK's own parser
+  (`ClientCredentials::from_str`): it validates the STANDARD_NO_PAD blob,
+  the typed JSON, and the client key/public-key consistency. Hand-rolled
+  base64 + `serde_json` decoding into the wrapper type rejected valid
+  blobs produced by the Lexe app.
 - Include Lexe in CI checks when the shared workflow changes.
 - Correct configuration examples and document TLS self-check behavior.
 - Add mocked payment lifecycle tests and database concurrency tests. The
