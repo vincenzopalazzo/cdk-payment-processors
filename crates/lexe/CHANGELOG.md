@@ -67,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the typed JSON, and the client key/public-key consistency. Hand-rolled
   base64 + `serde_json` decoding into the wrapper type rejected valid
   blobs produced by the Lexe app.
+- Skip `provision` for SDK client credentials: delegated provisioning is
+  not implemented in lexe-sdk 0.1.22 (only the root seed can sign), and
+  the Lexe app keeps the node provisioned. Seed-phrase wallets still
+  provision on startup.
 - Include Lexe in CI checks when the shared workflow changes.
 - Correct configuration examples and document TLS self-check behavior.
 - Add mocked payment lifecycle tests and database concurrency tests. The

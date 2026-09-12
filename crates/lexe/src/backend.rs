@@ -144,23 +144,16 @@ impl LexeBackend {
         {
             let cc = decode_client_credentials(raw).map_err(|e| Error::Custom(e.to_string()))?;
             let credentials = CredentialsRef::ClientCredentials(&cc);
-            let wallet =
-                match LexeWallet::load(env_config.clone(), credentials, Some(data_dir.clone()))
-                    .map_err(|e| Error::Custom(format!("failed to load Lexe wallet: {e}")))?
-                {
-                    Some(wallet) => wallet,
-                    None => {
-                        LexeWallet::fresh(env_config.clone(), credentials, Some(data_dir.clone()))
-                            .map_err(|e| {
-                            Error::Custom(format!("failed to initialize Lexe wallet: {e}"))
-                        })?
-                    }
-                };
-            wallet
-                .provision(credentials)
-                .await
-                .map_err(|e| Error::Custom(format!("failed to provision Lexe node: {e}")))?;
-            wallet
+            // Delegated clients cannot provision (only the root seed can
+            // sign); the Lexe app keeps the node provisioned, so just load
+            // or initialize the local wallet db and connect.
+            match LexeWallet::load(env_config.clone(), credentials, Some(data_dir.clone()))
+                .map_err(|e| Error::Custom(format!("failed to load Lexe wallet: {e}")))?
+            {
+                Some(wallet) => wallet,
+                None => LexeWallet::fresh(env_config.clone(), credentials, Some(data_dir.clone()))
+                    .map_err(|e| Error::Custom(format!("failed to initialize Lexe wallet: {e}")))?,
+            }
         } else if let Some(seed) = backend.seed_phrase.as_deref().map(str::trim) {
             let mnemonic = lexe::bip39::Mnemonic::parse_normalized(seed)
                 .map_err(|e| Error::Custom(format!("invalid BIP39 mnemonic: {e}")))?;
