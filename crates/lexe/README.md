@@ -75,6 +75,12 @@ client credentials are the same base64 blob lexe-mcp uses as
 `Authorization: Bearer <credentials>`; the processor decodes it and uses it
 to talk to the Lexe node with mTLS-attested, token-refreshed connections.
 
+When creating the SDK client in the Lexe app, grant the scopes the
+processor needs: **Read info** + **Read payments** (status checks and the
+payment-event stream), **Receive** (mint: `create_invoice`), and **Spend**
+(melt: `pay_invoice`). A client without these is rejected by the node with
+`Client lacks the required permission` (HTTP 403, error code 10).
+
 With TLS enabled, `tls_client_ca_path` must contain the CA certificate that
 signed the mint's `client.pem`; clients without a trusted certificate are
 rejected. Configure the mint's `[grpc_processor].tls_dir` with `ca.pem`,
